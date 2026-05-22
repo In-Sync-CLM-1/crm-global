@@ -8,8 +8,13 @@ export const DEFAULT_FROM_NUMBER = "+911169323462";
 export const DAILY_CONNECTED_TARGET = 80;
 // Connected = call duration above this threshold (seconds). Below = no-answer / hangup.
 export const CONNECTED_THRESHOLD_SEC = 5;
-// How many calls to keep queued ahead of the in-flight one
-export const QUEUE_DEPTH = 12;
+// How many calls to keep queued ahead of the in-flight ones
+export const QUEUE_DEPTH = 25;
+// How many concurrent calls to keep in flight (read from env so it can be raised for a burst day without redeploy)
+export function getConcurrency(): number {
+  const v = parseInt(Deno.env.get("AI_CONCURRENCY") ?? "1", 10);
+  return Number.isFinite(v) && v >= 1 ? Math.min(v, 20) : 1;
+}
 
 /**
  * Returns true if the current moment is inside the AI calling window in IST.
@@ -22,14 +27,22 @@ export function isInsideWorkingWindow(now: Date = new Date()): { inside: boolean
   if (istMinutes >= 660 && istMinutes < 810) {
     return { inside: true, window: 1, reason: "inside window 1 (11:00-13:30 IST)" };
   }
-  // Window 2: 15:00 (900) – 17:00 (1020)
-  if (istMinutes >= 900 && istMinutes < 1020) {
-    return { inside: true, window: 2, reason: "inside window 2 (15:00-17:00 IST)" };
+  // Window 2 end is env-tunable so we can extend on short notice (default 17:00 = 1020).
+  const win2End = parseInt(Deno.env.get("AI_WINDOW2_END_MIN") ?? "1020", 10);
+  const win2EndMin = Number.isFinite(win2End) && win2End >= 900 && win2End <= 1440 ? win2End : 1020;
+  if (istMinutes >= 900 && istMinutes < win2EndMin) {
+    return { inside: true, window: 2, reason: `inside window 2 (15:00-${formatIstMin(win2EndMin)} IST)` };
   }
   if (istMinutes >= 810 && istMinutes < 900) {
     return { inside: false, window: null, reason: "lunch break (13:30-15:00 IST)" };
   }
-  return { inside: false, window: null, reason: "outside business hours (11:00-17:00 IST)" };
+  return { inside: false, window: null, reason: `outside business hours (11:00-${formatIstMin(win2EndMin)} IST)` };
+}
+
+function formatIstMin(m: number): string {
+  const h = Math.floor(m / 60);
+  const mm = m % 60;
+  return `${String(h).padStart(2, '0')}:${String(mm).padStart(2, '0')}`;
 }
 
 export function nowIstMinutesSinceMidnight(now: Date = new Date()): number {

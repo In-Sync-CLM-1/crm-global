@@ -10,6 +10,7 @@ import {
   DAILY_CONNECTED_TARGET,
   CONNECTED_THRESHOLD_SEC,
   QUEUE_DEPTH,
+  getConcurrency,
 } from "../_shared/aiCalling.ts";
 
 const corsHeaders = {
@@ -215,49 +216,58 @@ serve(async (req) => {
     queuedNow = queuedRows.length;
   }
 
-  // 7. If no in-flight call AND we have queued calls, kick off the next one to start the chain
-  let dispatched = false;
-  if (inFlight === 0) {
+  // 7. Top up in-flight calls to the configured concurrency.
+  //    Each cron tick fires the gap; the webhook also chains within a batch as calls end.
+  const concurrency = getConcurrency();
+  const slotsToFill = Math.max(0, concurrency - inFlight);
+  let dispatched = 0;
+  for (let i = 0; i < slotsToFill; i++) {
+    // Pick the oldest queued row so older batches drain before newer ones.
     const { data: nextRow } = await supabase
       .from("call_logs")
       .select("id, contact_id, to_number")
       .eq("org_id", INSYNC_DEMO_ORG_ID)
       .eq("caller_type", "ai")
       .eq("status", "queued")
+      .order("created_at", { ascending: true })
       .order("bolna_queue_position", { ascending: true })
       .limit(1)
       .maybeSingle();
 
-    if (nextRow) {
-      const { data: contact } = await supabase
-        .from("contacts")
-        .select("id, first_name, last_name, company, job_title")
-        .eq("id", nextRow.contact_id)
-        .maybeSingle();
+    if (!nextRow) break;
 
-      if (contact) {
-        const result = await triggerBolnaCall(bolnaKey, {
-          agentId,
-          toNumber: nextRow.to_number,
-          callLogId: nextRow.id,
-          contact,
-        });
+    const { data: contact } = await supabase
+      .from("contacts")
+      .select("id, first_name, last_name, company, job_title")
+      .eq("id", nextRow.contact_id)
+      .maybeSingle();
 
-        if (result.error) {
-          await supabase.from("call_logs").update({ status: "error" }).eq("id", nextRow.id);
-        } else {
-          await supabase
-            .from("call_logs")
-            .update({
-              status: "in_progress",
-              bolna_execution_id: result.execution_id,
-              started_at: new Date().toISOString(),
-            })
-            .eq("id", nextRow.id);
-          dispatched = true;
-        }
-      }
+    if (!contact) {
+      await supabase.from("call_logs").update({ status: "error" }).eq("id", nextRow.id);
+      continue;
     }
+
+    const result = await triggerBolnaCall(bolnaKey, {
+      agentId,
+      toNumber: nextRow.to_number,
+      callLogId: nextRow.id,
+      contact,
+    });
+
+    if (result.error) {
+      await supabase.from("call_logs").update({ status: "error" }).eq("id", nextRow.id);
+      continue;
+    }
+
+    await supabase
+      .from("call_logs")
+      .update({
+        status: "in_progress",
+        bolna_execution_id: result.execution_id,
+        started_at: new Date().toISOString(),
+      })
+      .eq("id", nextRow.id);
+    dispatched++;
   }
 
   return done(200, {
@@ -266,10 +276,11 @@ serve(async (req) => {
     window: workWindow.window,
     connected_today: connectedToday,
     target: DAILY_CONNECTED_TARGET,
-    in_flight: inFlight,
+    concurrency,
+    in_flight_before: inFlight,
     queued_before: queued,
     queued_now: queuedNow,
-    dispatched_new_chain: dispatched,
+    dispatched,
     stale_closed: staleClosed,
   });
 });
@@ -278,47 +289,24 @@ async function queueUntouchedContacts(
   supabase: any,
   args: { script: ScriptRow; agentId: string; limit: number },
 ): Promise<Array<{ id: string }>> {
-  const { script, agentId, limit } = args;
+  const { script, limit } = args;
 
-  // Find Won/Lost stage IDs so we can exclude them
-  const { data: stages } = await supabase
-    .from("pipeline_stages")
-    .select("id, name")
-    .eq("org_id", INSYNC_DEMO_ORG_ID);
-
-  const terminalStageIds = (stages || [])
-    .filter((s: any) => ["won", "lost"].includes((s.name || "").toLowerCase()))
-    .map((s: any) => s.id);
-
-  // Find contacts in this org that have a phone and have NEVER had a call_log
-  // We rely on the absence of any call_logs row keyed by contact_id.
-  let q = supabase
-    .from("contacts")
-    .select("id, first_name, last_name, phone, company, job_title")
-    .eq("org_id", INSYNC_DEMO_ORG_ID)
-    .not("phone", "is", null)
-    .neq("phone", "")
-    .order("created_at", { ascending: false })
-    .limit(Math.max(limit * 50, 600)); // over-fetch generously — recent contacts may be mostly already-called
-
-  if (terminalStageIds.length > 0) {
-    q = q.not("pipeline_stage_id", "in", `(${terminalStageIds.join(",")})`);
+  // Candidate selection runs server-side via RPC. Applies these rules:
+  //   - has phone, not in Won/Lost, not do_not_call
+  //   - phone/name does not match any profile in the same org (don't call colleagues)
+  //   - fewer than 3 actually-dialed AI attempts ever
+  //   - last attempt was on an earlier IST calendar day (no same-day retry)
+  // Previously this was a client-side .in() filter on the top-600 contacts which silently
+  // failed with HeadersOverflowError once the URL exceeded ~16KB, causing the same contact
+  // to be re-queued every cron tick. The RPC avoids that entire failure mode.
+  const { data: untouched, error: rpcErr } = await supabase.rpc("get_ai_call_candidates", {
+    p_org: INSYNC_DEMO_ORG_ID,
+    p_limit: limit,
+  });
+  if (rpcErr || !untouched || untouched.length === 0) {
+    if (rpcErr) console.error("get_ai_call_candidates rpc error:", rpcErr);
+    return [];
   }
-
-  const { data: candidateContacts } = await q;
-  if (!candidateContacts || candidateContacts.length === 0) return [];
-
-  // Filter out contacts that already have any call_log row (human or AI)
-  const candidateIds = candidateContacts.map((c: any) => c.id);
-  const { data: existingCallContacts } = await supabase
-    .from("call_logs")
-    .select("contact_id")
-    .in("contact_id", candidateIds);
-
-  const touchedSet = new Set((existingCallContacts || []).map((r: any) => r.contact_id));
-  const untouched = candidateContacts.filter((c: any) => !touchedSet.has(c.id)).slice(0, limit);
-
-  if (untouched.length === 0) return [];
 
   // Get current queue tail position
   const { data: maxRow } = await supabase
