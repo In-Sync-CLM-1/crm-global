@@ -1,0 +1,263 @@
+// Shared helpers for AI calling: working-window gate, Bolna agent provisioning, call dispatch.
+
+export const INSYNC_DEMO_ORG_ID = "61f7f96d-e80c-4d9b-a765-8eb32bd3c70d";
+export const BOLNA = "https://api.bolna.ai";
+// Exotel "Agentic Call" ExoPhone — required as from_phone_number; Exotel routes channels automatically.
+export const DEFAULT_FROM_NUMBER = "+911169323462";
+// Targets
+export const DAILY_CONNECTED_TARGET = 80;
+// Connected = call duration above this threshold (seconds). Below = no-answer / hangup.
+export const CONNECTED_THRESHOLD_SEC = 5;
+// How many calls to keep queued ahead of the in-flight one
+export const QUEUE_DEPTH = 12;
+
+/**
+ * Returns true if the current moment is inside the AI calling window in IST.
+ * Window: 11:00–13:30 IST (window 1), 15:00–17:00 IST (window 2). Lunch break in between.
+ * Equivalent UTC: 05:30–08:00 (window 1), 09:30–11:30 (window 2).
+ */
+export function isInsideWorkingWindow(now: Date = new Date()): { inside: boolean; window: 1 | 2 | null; reason: string } {
+  const istMinutes = nowIstMinutesSinceMidnight(now);
+  // Window 1: 11:00 (660) – 13:30 (810)
+  if (istMinutes >= 660 && istMinutes < 810) {
+    return { inside: true, window: 1, reason: "inside window 1 (11:00-13:30 IST)" };
+  }
+  // Window 2: 15:00 (900) – 17:00 (1020)
+  if (istMinutes >= 900 && istMinutes < 1020) {
+    return { inside: true, window: 2, reason: "inside window 2 (15:00-17:00 IST)" };
+  }
+  if (istMinutes >= 810 && istMinutes < 900) {
+    return { inside: false, window: null, reason: "lunch break (13:30-15:00 IST)" };
+  }
+  return { inside: false, window: null, reason: "outside business hours (11:00-17:00 IST)" };
+}
+
+export function nowIstMinutesSinceMidnight(now: Date = new Date()): number {
+  // IST = UTC + 5:30
+  const utcMinutes = now.getUTCHours() * 60 + now.getUTCMinutes();
+  return (utcMinutes + 5 * 60 + 30) % (24 * 60);
+}
+
+export function normalizePhone(p: string | null | undefined): string | null {
+  if (!p) return null;
+  const trimmed = p.trim();
+  if (!trimmed) return null;
+  if (trimmed.startsWith("+")) return trimmed;
+  const digits = trimmed.replace(/\D/g, "");
+  if (digits.startsWith("91") && digits.length === 12) return `+${digits}`;
+  if (digits.length === 10) return `+91${digits}`;
+  return trimmed;
+}
+
+export function bolnaHeaders(key: string): HeadersInit {
+  return { Authorization: `Bearer ${key}`, "Content-Type": "application/json" };
+}
+
+export interface ScriptRow {
+  id: string;
+  org_id: string;
+  name: string;
+  objective: string;
+  opening: string;
+  key_points: unknown;
+  objection_handling: unknown;
+  closing: string | null;
+  product_name: string | null;
+  product_notes: string | null;
+  voice_id: string | null;
+  voice_name: string | null;
+  language: string | null;
+  max_duration_seconds: number | null;
+  bolna_agent_id: string | null;
+  behavioral_guidelines?: string | null;
+}
+
+export function composeSystemPrompt(script: ScriptRow): string {
+  const keyPoints = Array.isArray(script.key_points) ? (script.key_points as string[]) : [];
+  const objections = (script.objection_handling && typeof script.objection_handling === "object")
+    ? (script.objection_handling as Record<string, string>)
+    : {};
+
+  const productLabel = script.product_name || "our product";
+  const parts: string[] = [
+    `You are an AI sales agent for ${productLabel}, calling {first_name} {last_name} from {company}.`,
+    `Your objective: ${script.objective}`,
+    "",
+    "Opening line:",
+    script.opening,
+    "",
+  ];
+
+  if (keyPoints.length > 0) {
+    parts.push("Key talking points (weave these in naturally):");
+    for (const p of keyPoints) parts.push(`- ${p}`);
+    parts.push("");
+  }
+
+  const objKeys = Object.keys(objections);
+  if (objKeys.length > 0) {
+    parts.push("If they raise objections, here is how to respond:");
+    for (const k of objKeys) parts.push(`\n${k}:\n${objections[k]}`);
+    parts.push("");
+  }
+
+  if (script.closing) {
+    parts.push("Closing:");
+    parts.push(script.closing);
+    parts.push("");
+  }
+
+  if (script.product_notes) {
+    parts.push("=== Product Reference (use this to answer detailed questions during the call. Treat these facts as authoritative; never invent pricing, features, or customer names outside this section.) ===");
+    parts.push(script.product_notes);
+    parts.push("=== End Product Reference ===");
+    parts.push("");
+  }
+
+  if (script.behavioral_guidelines) {
+    parts.push("=== Behavioral guidelines (how to handle the call, not what to say) ===");
+    parts.push(script.behavioral_guidelines);
+    parts.push("=== End behavioral guidelines ===");
+    parts.push("");
+  }
+
+  parts.push(
+    "=== Speaking style ===",
+    "Speak naturally and conversationally, like a warm, professional sales rep — not a script reader.",
+    "Listen actively. Imagine you are talking to a busy operations head.",
+    "End each thought clearly so the prospect has a chance to respond.",
+    "",
+    "=== Pronunciation rules (the synthesizer reads your text literally) ===",
+    "Say \"WorkSync\" as one word.",
+    "Say \"H R\" letter by letter — write \"H R\" with a space.",
+    "Say \"rupees\" always. Never write \"Rs\".",
+    "Say \"WhatsApp\" as one word.",
+    "For amounts and numbers, prefer spoken form.",
+    "",
+    `Speak in clear, natural ${script.language === "hi" ? "Hindi" : "English"}.`,
+  );
+
+  return parts.join("\n");
+}
+
+export interface AgentCreateInput {
+  script: ScriptRow;
+  webhookUrl: string;
+}
+
+export async function createBolnaAgent(bolnaKey: string, input: AgentCreateInput): Promise<string> {
+  const { script, webhookUrl } = input;
+  const systemPrompt = composeSystemPrompt(script);
+  const welcomeMessage = script.opening || "Hello, do you have a moment to talk?";
+
+  const agentBody = {
+    agent_config: {
+      agent_name: `gcrm-${script.id.slice(0, 8)}-${Date.now()}`,
+      agent_welcome_message: welcomeMessage,
+      webhook_url: webhookUrl,
+      tasks: [{
+        task_type: "conversation",
+        toolchain: { execution: "parallel", pipelines: [["transcriber", "llm", "synthesizer"]] },
+        tools_config: {
+          input: { provider: "exotel", format: "wav", samples_per_second: 8000 },
+          output: { provider: "exotel", format: "wav", samples_per_second: 8000 },
+          llm_agent: {
+            agent_type: "simple_llm_agent",
+            agent_flow_type: "streaming",
+            llm_config: {
+              family: "openai",
+              model: "gpt-4o-mini",
+              temperature: 0.4,
+              max_tokens: 250,
+            },
+          },
+          transcriber: {
+            provider: "deepgram",
+            model: "nova-2",
+            language: script.language || "en",
+            stream: true,
+            encoding: "linear16",
+            endpointing: 400,
+          },
+          synthesizer: {
+            provider: "elevenlabs",
+            stream: true,
+            provider_config: {
+              voice: script.voice_name || "Riya Rao - Professional Voice",
+              voice_id: script.voice_id || "vYENaCJHl4vFKNDYPr8y",
+              model: "eleven_turbo_v2_5",
+            },
+          },
+        },
+        task_config: {
+          hangup_after_silence: 10,
+          call_terminate: script.max_duration_seconds || 240,
+          backchanneling: false,
+          check_if_user_online: false,
+        },
+      }],
+    },
+    agent_prompts: {
+      task_1: { system_prompt: systemPrompt },
+    },
+  };
+
+  const res = await fetch(`${BOLNA}/v2/agent`, {
+    method: "POST",
+    headers: bolnaHeaders(bolnaKey),
+    body: JSON.stringify(agentBody),
+  });
+  const text = await res.text();
+  if (!res.ok) throw new Error(`Bolna agent create failed: ${res.status} ${text}`);
+  let json: { agent_id?: string; id?: string };
+  try { json = JSON.parse(text); } catch { throw new Error(`Bolna agent response not JSON: ${text}`); }
+  const id = json.agent_id ?? json.id;
+  if (!id) throw new Error(`Bolna agent response missing id: ${text}`);
+  return id;
+}
+
+export interface TriggerCallInput {
+  agentId: string;
+  toNumber: string;
+  fromNumber?: string;
+  contact: {
+    id: string;
+    first_name?: string | null;
+    last_name?: string | null;
+    company?: string | null;
+    job_title?: string | null;
+  };
+  callLogId: string;
+}
+
+export async function triggerBolnaCall(
+  bolnaKey: string,
+  input: TriggerCallInput,
+): Promise<{ execution_id?: string; error?: string }> {
+  const callBody = {
+    agent_id: input.agentId,
+    recipient_phone_number: input.toNumber,
+    from_phone_number: input.fromNumber || DEFAULT_FROM_NUMBER,
+    user_data: {
+      contact_id: input.contact.id,
+      call_log_id: input.callLogId,
+      first_name: input.contact.first_name ?? "",
+      last_name: input.contact.last_name ?? "",
+      company: input.contact.company ?? "your company",
+      job_title: input.contact.job_title ?? "",
+    },
+  };
+
+  const res = await fetch(`${BOLNA}/call`, {
+    method: "POST",
+    headers: bolnaHeaders(bolnaKey),
+    body: JSON.stringify(callBody),
+  });
+  const text = await res.text();
+  let json: Record<string, unknown> = {};
+  try { json = JSON.parse(text); } catch { /* keep raw */ }
+  if (!res.ok) return { error: `${res.status}: ${text}` };
+  const execId = (json.execution_id as string) ?? (json.run_id as string);
+  if (!execId) return { error: `No execution_id in Bolna response: ${text}` };
+  return { execution_id: execId };
+}

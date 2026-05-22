@@ -1,0 +1,7 @@
+name = "globalcrm-recordings-r2"
+main = "src/index.ts"
+compatibility_date = "2025-01-01"
+
+[[r2_buckets]]
+binding = "RECORDINGS"
+bucket_name = "globalcrm-call-recordings"
