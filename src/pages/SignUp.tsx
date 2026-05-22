@@ -349,6 +349,22 @@ export default function SignUp() {
               {emailOtpStatus === "sending" && (
                 <Loader2 className="h-4 w-4 shrink-0 animate-spin text-muted-foreground" />
               )}
+              {emailOtpStatus === "idle" && (
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  className="h-8 shrink-0 px-3 text-xs"
+                  disabled={!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(formData.email.trim())}
+                  onClick={() => {
+                    const email = formData.email.trim().toLowerCase();
+                    emailOtpSentFor.current = email;
+                    sendOtpForValue("email", email);
+                  }}
+                >
+                  Send code
+                </Button>
+              )}
             </div>
             {(emailOtpStatus === "sent" || emailOtpStatus === "verifying") && (
               <div className="space-y-1">
@@ -402,6 +418,22 @@ export default function SignUp() {
               )}
               {phoneOtpStatus === "sending" && (
                 <Loader2 className="h-4 w-4 shrink-0 animate-spin text-muted-foreground" />
+              )}
+              {phoneOtpStatus === "idle" && (
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  className="h-8 shrink-0 px-3 text-xs"
+                  disabled={!/^[6-9]\d{9}$/.test(formData.phone.replace(/\D/g, ""))}
+                  onClick={() => {
+                    const clean = formData.phone.replace(/\D/g, "");
+                    phoneOtpSentFor.current = clean;
+                    sendOtpForValue("phone", clean);
+                  }}
+                >
+                  Send code
+                </Button>
               )}
             </div>
             {(phoneOtpStatus === "sent" || phoneOtpStatus === "verifying") && (
