@@ -143,3 +143,12 @@ verify_jwt = false
 
 [functions.verify-otp]
 verify_jwt = false
+
+[functions.ai-bolna-webhook]
+verify_jwt = false
+
+[functions.ai-bulk-call]
+verify_jwt = true
+
+[functions.ai-callback-dispatcher]
+verify_jwt = true
