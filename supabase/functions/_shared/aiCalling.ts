@@ -19,9 +19,13 @@ export function getConcurrency(): number {
 /**
  * Returns true if the current moment is inside the AI calling window in IST.
  * Window: 11:00–13:30 IST (window 1), 15:00–17:00 IST (window 2). Lunch break in between.
+ * Mon–Sat only — no calling on Sunday.
  * Equivalent UTC: 05:30–08:00 (window 1), 09:30–11:30 (window 2).
  */
 export function isInsideWorkingWindow(now: Date = new Date()): { inside: boolean; window: 1 | 2 | null; reason: string } {
+  if (nowIstDayOfWeek(now) === 0) {
+    return { inside: false, window: null, reason: "Sunday — no calling" };
+  }
   const istMinutes = nowIstMinutesSinceMidnight(now);
   // Window 1: 11:00 (660) – 13:30 (810)
   if (istMinutes >= 660 && istMinutes < 810) {
@@ -49,6 +53,14 @@ export function nowIstMinutesSinceMidnight(now: Date = new Date()): number {
   // IST = UTC + 5:30
   const utcMinutes = now.getUTCHours() * 60 + now.getUTCMinutes();
   return (utcMinutes + 5 * 60 + 30) % (24 * 60);
+}
+
+// 0 = Sunday, 1 = Monday, … 6 = Saturday, in IST.
+export function nowIstDayOfWeek(now: Date = new Date()): number {
+  const utcMinutes = now.getUTCHours() * 60 + now.getUTCMinutes();
+  const istTotal = utcMinutes + 5 * 60 + 30;
+  const dayShift = Math.floor(istTotal / (24 * 60));
+  return (now.getUTCDay() + dayShift) % 7;
 }
 
 export function normalizePhone(p: string | null | undefined): string | null {
