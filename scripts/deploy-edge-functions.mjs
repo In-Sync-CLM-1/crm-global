@@ -48,9 +48,21 @@ for (const slug of slugs) {
   console.log(`\n=== Deploying ${slug} ===`);
   const { src, sharedFiles } = await loadShared(slug);
   const fd = new FormData();
+  const publicFunctions = new Set([
+    "email-inbound-webhook",
+    "setup-resend-webhook",
+    "ai-bolna-webhook",
+    "whatsapp-webhook",
+    "exotel-webhook",
+    "webhook-receiver",
+    "outbound-webhook-handler",
+    "submit-public-form",
+    "check-next-actions",
+    "retry-failed-whatsapp",
+  ]);
   fd.append(
     "metadata",
-    JSON.stringify({ name: slug, verify_jwt: ["email-inbound-webhook", "setup-resend-webhook"].includes(slug) ? false : true, entrypoint_path: "index.ts" })
+    JSON.stringify({ name: slug, verify_jwt: !publicFunctions.has(slug), entrypoint_path: "index.ts" })
   );
   fd.append("file", new Blob([src], { type: "application/typescript" }), "index.ts");
   for (const shared of sharedFiles) {

@@ -31,6 +31,8 @@ import { useUrlFilterState } from "@/hooks/useUrlFilterState";
 import { Checkbox } from "@/components/ui/checkbox";
 import { BulkCallDialog } from "@/components/Pipeline/BulkCallDialog";
 import { PostCallDispositionDialog } from "@/components/Contact/PostCallDispositionDialog";
+import IedupPipeline from "@/pages/IedupPipeline";
+import { IEDUP_ORG_ID } from "@/hooks/useIsIedup";
 interface PipelineStage {
   id: string;
   name: string;
@@ -113,6 +115,12 @@ function parseEmailOutreach(source: string | null | undefined): { campaign: stri
 }
 
 export default function PipelineBoard() {
+  // IEDUP-only minimal pipeline view (CSV upload + dialer controls + beneficiary list)
+  const { effectiveOrgId: pipelineOrgId } = useOrgContext();
+  if (pipelineOrgId === IEDUP_ORG_ID) {
+    return <IedupPipeline />;
+  }
+
   const [filteredContacts, setFilteredContacts] = useState<Contact[] | null>(null);
   const [draggedContact, setDraggedContact] = useState<string | null>(null);
   

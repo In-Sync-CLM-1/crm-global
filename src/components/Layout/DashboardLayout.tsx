@@ -54,6 +54,7 @@ import { useAuth } from "@/contexts/AuthProvider";
 import { useQuery } from "@tanstack/react-query";
  import { FloatingChatWidget } from "@/components/chat/FloatingChatWidget";
 import { useTotalUnreadCount } from "@/hooks/useConversations";
+import { IEDUP_ORG_ID } from "@/hooks/useIsIedup";
 
 interface DashboardLayoutProps {
   children: ReactNode;
@@ -114,13 +115,14 @@ function DashboardLayout({ children }: DashboardLayoutProps) {
 
   // Derived state from cached data
   const userRole = userData?.role || null;
-  const userName = userData?.profile 
-    ? `${userData.profile.first_name} ${userData.profile.last_name}` 
+  const userName = userData?.profile
+    ? `${userData.profile.first_name} ${userData.profile.last_name}`
     : "";
   const isPlatformAdmin = userData?.profile?.is_platform_admin || false;
   const orgLogo = userData?.org?.logo_url || "";
   const orgName = userData?.org?.name || "";
   const onboardingCompleted = userData?.profile?.onboarding_completed || false;
+  const isIedup = userData?.profile?.org_id === IEDUP_ORG_ID;
 
   // Check if user needs onboarding
   useEffect(() => {
@@ -237,8 +239,38 @@ function DashboardLayout({ children }: DashboardLayoutProps) {
                 </>
               )}
 
+              {/* IEDUP-only minimal navigation: Dashboard + Pipeline + Users */}
+              {!isPlatformAdmin && isIedup && (
+                <>
+                  <Link
+                    to="/dashboard"
+                    className="flex items-center gap-2 px-2 py-1.5 rounded-md text-sm text-sidebar-foreground hover:bg-sidebar-accent hover:text-sidebar-primary transition-colors"
+                    onClick={() => setSidebarOpen(false)}
+                  >
+                    <LayoutDashboard size={16} className="shrink-0 text-sidebar-muted" />
+                    <span>Dashboard</span>
+                  </Link>
+                  <Link
+                    to="/pipeline"
+                    className="flex items-center gap-2 px-2 py-1.5 rounded-md text-sm text-sidebar-foreground hover:bg-sidebar-accent hover:text-sidebar-primary transition-colors"
+                    onClick={() => setSidebarOpen(false)}
+                  >
+                    <GitBranch size={16} className="shrink-0 text-sidebar-muted" />
+                    <span>Pipeline</span>
+                  </Link>
+                  <Link
+                    to="/users"
+                    className="flex items-center gap-2 px-2 py-1.5 rounded-md text-sm text-sidebar-foreground hover:bg-sidebar-accent hover:text-sidebar-primary transition-colors"
+                    onClick={() => setSidebarOpen(false)}
+                  >
+                    <UserCog size={16} className="shrink-0 text-sidebar-muted" />
+                    <span>Users</span>
+                  </Link>
+                </>
+              )}
+
               {/* Regular user navigation */}
-              {!isPlatformAdmin && (
+              {!isPlatformAdmin && !isIedup && (
                 <>
               {/* Dashboards & Reports Section */}
               {showDashboardsSection && (

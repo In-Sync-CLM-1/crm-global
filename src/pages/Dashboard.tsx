@@ -20,12 +20,19 @@ import { DueTodayCard } from "@/components/Dashboard/DueTodayCard";
 import { CompactDashboard } from "@/components/Dashboard/CompactDashboard";
 import { SDRDashboard } from "@/components/Dashboard/SDRDashboard";
 import { useUserRole } from "@/hooks/useUserRole";
+import IedupDashboard from "@/pages/IedupDashboard";
+import { IEDUP_ORG_ID } from "@/hooks/useIsIedup";
 
 const INSYNC_DEMO_ORG_ID = "61f7f96d-e80c-4d9b-a765-8eb32bd3c70d";
 
 export default function Dashboard() {
   const { effectiveOrgId, isLoading: orgLoading } = useOrgContext();
   const { isAdmin, isSuperAdmin, loading: roleLoading } = useUserRole();
+
+  // IEDUP org: render the dedicated minimal dashboard
+  if (effectiveOrgId === IEDUP_ORG_ID) {
+    return <IedupDashboard />;
+  }
 
   // In-Sync Demo: admins see team-level compact dashboard; SDRs see their own dashboard
   if (effectiveOrgId === INSYNC_DEMO_ORG_ID) {

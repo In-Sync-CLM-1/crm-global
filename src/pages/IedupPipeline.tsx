@@ -1,0 +1,551 @@
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import Papa from "papaparse";
+import { supabase } from "@/integrations/supabase/client";
+import DashboardLayout from "@/components/Layout/DashboardLayout";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Badge } from "@/components/ui/badge";
+import { Label } from "@/components/ui/label";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
+  Play,
+  Pause,
+  Upload,
+  Download,
+  Trash2,
+  Phone,
+  Plus,
+  X,
+  Clock,
+  Loader2,
+} from "lucide-react";
+import { IEDUP_ORG_ID } from "@/hooks/useIsIedup";
+import { useNotification } from "@/hooks/useNotification";
+
+interface WindowSlot {
+  start_min: number;
+  end_min: number;
+}
+
+interface BeneficiaryRow {
+  id: string;
+  first_name: string | null;
+  last_name: string | null;
+  name_hi: string | null;
+  phone: string | null;
+  do_not_call: boolean | null;
+  last_contacted_at: string | null;
+  status: string | null;
+}
+
+interface UploadRow {
+  name_en: string;
+  number: string;
+  name_hi: string;
+}
+
+const CSV_TEMPLATE = `name,number\nVibhu Dixit,+917607359820\n`;
+
+export default function IedupPipeline() {
+  const notify = useNotification();
+  const qc = useQueryClient();
+
+  // Org settings
+  const { data: settings } = useQuery({
+    queryKey: ["iedup-org-settings"],
+    queryFn: async () => {
+      const { data } = await supabase
+        .from("organization_settings")
+        .select("dialing_active, calling_windows")
+        .eq("org_id", IEDUP_ORG_ID)
+        .maybeSingle();
+      return data;
+    },
+  });
+
+  // Beneficiaries list
+  const { data: beneficiaries, refetch: refetchList } = useQuery({
+    queryKey: ["iedup-beneficiaries"],
+    queryFn: async () => {
+      const { data, error } = await supabase
+        .from("contacts")
+        .select("id, first_name, last_name, name_hi, phone, do_not_call, last_contacted_at, status")
+        .eq("org_id", IEDUP_ORG_ID)
+        .order("created_at", { ascending: false });
+      if (error) throw error;
+      return (data || []) as BeneficiaryRow[];
+    },
+    refetchInterval: 30_000,
+  });
+
+  // Upload state
+  const [uploadOpen, setUploadOpen] = useState(false);
+  const [uploadRows, setUploadRows] = useState<UploadRow[]>([]);
+  const [transliterating, setTransliterating] = useState(false);
+  const [importing, setImporting] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Calling window editor state
+  const [windowsDraft, setWindowsDraft] = useState<WindowSlot[]>([]);
+  const [windowsDirty, setWindowsDirty] = useState(false);
+  useEffect(() => {
+    if (settings?.calling_windows) {
+      setWindowsDraft(Array.isArray(settings.calling_windows) ? (settings.calling_windows as WindowSlot[]) : []);
+      setWindowsDirty(false);
+    }
+  }, [settings?.calling_windows]);
+
+  const dialingActive = settings?.dialing_active ?? false;
+
+  function handleDownloadTemplate() {
+    const blob = new Blob([CSV_TEMPLATE], { type: "text/csv;charset=utf-8" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "iedup_beneficiaries_template.csv";
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }
+
+  async function handleFilePicked(e: React.ChangeEvent<HTMLInputElement>) {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    Papa.parse<{ name?: string; number?: string }>(f, {
+      header: true,
+      skipEmptyLines: true,
+      complete: async (res) => {
+        const rows: UploadRow[] = (res.data || [])
+          .map((r) => ({
+            name_en: String(r.name || "").trim(),
+            number: normalizePhone(String(r.number || "")),
+            name_hi: "",
+          }))
+          .filter((r) => r.name_en && r.number);
+        if (rows.length === 0) {
+          notify.error("Empty file", "No valid rows found. Make sure the file has 'name' and 'number' columns.");
+          if (fileInputRef.current) fileInputRef.current.value = "";
+          return;
+        }
+        setUploadRows(rows);
+        setUploadOpen(true);
+        setTransliterating(true);
+        try {
+          const { data, error } = await supabase.functions.invoke("transliterate-names", {
+            body: { names: rows.map((r) => r.name_en) },
+          });
+          if (error) throw error;
+          const hi = (data?.names_hi || []) as string[];
+          setUploadRows((prev) =>
+            prev.map((r, i) => ({ ...r, name_hi: hi[i] || r.name_en })),
+          );
+        } catch (err: any) {
+          notify.warning("Hindi name conversion failed", "You can edit the Hindi names manually before importing.");
+          setUploadRows((prev) => prev.map((r) => ({ ...r, name_hi: r.name_en })));
+        } finally {
+          setTransliterating(false);
+          if (fileInputRef.current) fileInputRef.current.value = "";
+        }
+      },
+      error: (err) => {
+        notify.error("Could not read file", err.message);
+        if (fileInputRef.current) fileInputRef.current.value = "";
+      },
+    });
+  }
+
+  async function handleImport() {
+    if (uploadRows.length === 0) return;
+    setImporting(true);
+    try {
+      const inserts = uploadRows.map((r) => {
+        const parts = r.name_en.trim().split(/\s+/);
+        return {
+          org_id: IEDUP_ORG_ID,
+          first_name: parts[0] || r.name_en,
+          last_name: parts.slice(1).join(" ") || null,
+          name_hi: r.name_hi || r.name_en,
+          phone: r.number,
+          product: "CM YUVA",
+          source: "iedup_csv_upload",
+        };
+      });
+      const { error } = await supabase.from("contacts").insert(inserts);
+      if (error) throw error;
+      notify.success("Beneficiaries imported", `${inserts.length} row(s) added to the pipeline.`);
+      setUploadOpen(false);
+      setUploadRows([]);
+      refetchList();
+      qc.invalidateQueries({ queryKey: ["iedup-data-counts"] });
+    } catch (err: any) {
+      notify.error("Import failed", err.message || "Could not save beneficiaries.");
+    } finally {
+      setImporting(false);
+    }
+  }
+
+  async function toggleDialing(start: boolean) {
+    try {
+      const { data, error } = await supabase.functions.invoke("ai-bulk-call", {
+        body: { action: start ? "start" : "stop", org_id: IEDUP_ORG_ID },
+      });
+      if (error) throw error;
+      notify.success(
+        start ? "Dialing started" : "Dialing stopped",
+        start ? "Calls will begin during the next calling-window tick." : "No new calls will be placed.",
+      );
+      if (start) {
+        // Trigger an immediate cron tick so dialing begins now (if we're in window)
+        supabase.functions.invoke("ai-bulk-call", { body: {} }).catch(() => undefined);
+      }
+      qc.invalidateQueries({ queryKey: ["iedup-org-settings"] });
+    } catch (err: any) {
+      notify.error("Could not change dialing state", err.message);
+    }
+  }
+
+  async function dialNow(row: BeneficiaryRow) {
+    try {
+      const { data, error } = await supabase.functions.invoke("ai-bulk-call", {
+        body: {
+          action: "test_call",
+          org_id: IEDUP_ORG_ID,
+          contact_id: row.id,
+          phone: row.phone,
+        },
+      });
+      if (error) throw error;
+      notify.success("Call placed", `Dialing ${row.phone} now.`);
+      refetchList();
+    } catch (err: any) {
+      notify.error("Dial failed", err.message);
+    }
+  }
+
+  async function deleteRow(row: BeneficiaryRow) {
+    if (!confirm(`Delete ${row.first_name || row.phone}? This cannot be undone.`)) return;
+    try {
+      const { error } = await supabase.from("contacts").delete().eq("id", row.id);
+      if (error) throw error;
+      notify.success("Deleted", "Beneficiary removed.");
+      refetchList();
+    } catch (err: any) {
+      notify.error("Delete failed", err.message);
+    }
+  }
+
+  function addWindow() {
+    setWindowsDraft((prev) => [...prev, { start_min: 660, end_min: 810 }]);
+    setWindowsDirty(true);
+  }
+  function removeWindow(i: number) {
+    setWindowsDraft((prev) => prev.filter((_, idx) => idx !== i));
+    setWindowsDirty(true);
+  }
+  function updateWindow(i: number, field: "start_min" | "end_min", v: string) {
+    const mins = parseTimeToMinutes(v);
+    setWindowsDraft((prev) =>
+      prev.map((w, idx) => (idx === i ? { ...w, [field]: mins } : w)),
+    );
+    setWindowsDirty(true);
+  }
+  async function saveWindows() {
+    try {
+      const { error } = await supabase
+        .from("organization_settings")
+        .upsert(
+          {
+            org_id: IEDUP_ORG_ID,
+            calling_windows: windowsDraft,
+            updated_at: new Date().toISOString(),
+          },
+          { onConflict: "org_id" },
+        );
+      if (error) throw error;
+      notify.success("Calling windows saved");
+      setWindowsDirty(false);
+      qc.invalidateQueries({ queryKey: ["iedup-org-settings"] });
+    } catch (err: any) {
+      notify.error("Could not save windows", err.message);
+    }
+  }
+
+  const statusReason = useMemo(() => {
+    if (!dialingActive) return "Dialing stopped by admin.";
+    if (windowsDraft.length === 0) return "Dialing on, but no calling windows configured.";
+    const m = istMinutesNow();
+    for (const w of windowsDraft) {
+      if (m >= w.start_min && m < w.end_min) return `Dialing on — inside window ${fmt(w.start_min)}–${fmt(w.end_min)} IST.`;
+    }
+    const nextStart = windowsDraft
+      .map((w) => w.start_min)
+      .filter((s) => s > m)
+      .sort((a, b) => a - b)[0];
+    if (nextStart != null) return `Dialing on — resumes at ${fmt(nextStart)} IST.`;
+    return "Dialing on — resumes at the next window.";
+  }, [dialingActive, windowsDraft]);
+
+  return (
+    <DashboardLayout>
+      <div className="space-y-6">
+        {/* Header + controls */}
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <h1 className="text-2xl font-semibold">Pipeline</h1>
+            <p className="text-sm text-muted-foreground">{statusReason}</p>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => fileInputRef.current?.click()}
+            >
+              <Upload className="mr-2 h-4 w-4" />
+              Upload CSV
+            </Button>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".csv,text/csv"
+              hidden
+              onChange={handleFilePicked}
+            />
+            <Button variant="ghost" size="sm" onClick={handleDownloadTemplate}>
+              <Download className="mr-2 h-4 w-4" />
+              Sample
+            </Button>
+            {dialingActive ? (
+              <Button variant="destructive" size="sm" onClick={() => toggleDialing(false)}>
+                <Pause className="mr-2 h-4 w-4" />
+                Stop
+              </Button>
+            ) : (
+              <Button size="sm" onClick={() => toggleDialing(true)}>
+                <Play className="mr-2 h-4 w-4" />
+                Start
+              </Button>
+            )}
+          </div>
+        </div>
+
+        {/* Calling window editor */}
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-base flex items-center gap-2">
+              <Clock className="h-4 w-4" />
+              Calling windows (IST)
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            {windowsDraft.length === 0 && (
+              <p className="text-sm text-muted-foreground">
+                No windows configured. Add one to allow the dialer to run.
+              </p>
+            )}
+            {windowsDraft.map((w, i) => (
+              <div key={i} className="flex items-center gap-2">
+                <Input
+                  type="time"
+                  value={fmt(w.start_min)}
+                  onChange={(e) => updateWindow(i, "start_min", e.target.value)}
+                  className="w-32"
+                />
+                <span className="text-muted-foreground">to</span>
+                <Input
+                  type="time"
+                  value={fmt(w.end_min)}
+                  onChange={(e) => updateWindow(i, "end_min", e.target.value)}
+                  className="w-32"
+                />
+                <Button variant="ghost" size="icon" onClick={() => removeWindow(i)}>
+                  <X className="h-4 w-4" />
+                </Button>
+              </div>
+            ))}
+            <div className="flex gap-2 pt-2">
+              <Button variant="outline" size="sm" onClick={addWindow}>
+                <Plus className="mr-2 h-4 w-4" />
+                Add window
+              </Button>
+              {windowsDirty && (
+                <Button size="sm" onClick={saveWindows}>Save</Button>
+              )}
+            </div>
+          </CardContent>
+        </Card>
+
+        {/* Beneficiaries table */}
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-base flex items-center justify-between">
+              <span>Beneficiaries</span>
+              <Badge variant="secondary">{beneficiaries?.length ?? 0}</Badge>
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            {(!beneficiaries || beneficiaries.length === 0) ? (
+              <p className="text-sm text-muted-foreground">
+                No beneficiaries yet. Click "Upload CSV" to add some.
+              </p>
+            ) : (
+              <div className="overflow-x-auto">
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>Name (EN)</TableHead>
+                      <TableHead>Name (HI)</TableHead>
+                      <TableHead>Number</TableHead>
+                      <TableHead>Status</TableHead>
+                      <TableHead>Last call</TableHead>
+                      <TableHead className="text-right">Actions</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {beneficiaries.map((b) => (
+                      <TableRow key={b.id}>
+                        <TableCell>{[b.first_name, b.last_name].filter(Boolean).join(" ")}</TableCell>
+                        <TableCell className="font-medium">{b.name_hi || "—"}</TableCell>
+                        <TableCell className="font-mono text-sm">{b.phone}</TableCell>
+                        <TableCell>
+                          {b.do_not_call ? (
+                            <Badge variant="destructive">Do not call</Badge>
+                          ) : b.last_contacted_at ? (
+                            <Badge variant="secondary">Called</Badge>
+                          ) : (
+                            <Badge variant="outline">Pending</Badge>
+                          )}
+                        </TableCell>
+                        <TableCell className="text-xs text-muted-foreground">
+                          {b.last_contacted_at ? new Date(b.last_contacted_at).toLocaleString() : "—"}
+                        </TableCell>
+                        <TableCell className="text-right">
+                          <div className="flex justify-end gap-1">
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              disabled={!b.phone || b.do_not_call === true}
+                              onClick={() => dialNow(b)}
+                            >
+                              <Phone className="h-4 w-4" />
+                            </Button>
+                            <Button variant="ghost" size="sm" onClick={() => deleteRow(b)}>
+                              <Trash2 className="h-4 w-4" />
+                            </Button>
+                          </div>
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </div>
+            )}
+          </CardContent>
+        </Card>
+
+        {/* Upload preview dialog */}
+        <Dialog open={uploadOpen} onOpenChange={setUploadOpen}>
+          <DialogContent className="max-w-3xl">
+            <DialogHeader>
+              <DialogTitle>Preview beneficiaries</DialogTitle>
+              <DialogDescription>
+                Review the Hindi names below. Click any Hindi cell to correct the spelling before importing.
+                {transliterating && (
+                  <span className="ml-2 inline-flex items-center gap-1 text-primary">
+                    <Loader2 className="h-3 w-3 animate-spin" /> Generating Hindi names…
+                  </span>
+                )}
+              </DialogDescription>
+            </DialogHeader>
+            <div className="max-h-[50vh] overflow-y-auto">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Name (EN)</TableHead>
+                    <TableHead>Name (HI) — editable</TableHead>
+                    <TableHead>Number</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {uploadRows.map((r, i) => (
+                    <TableRow key={i}>
+                      <TableCell>{r.name_en}</TableCell>
+                      <TableCell>
+                        <Input
+                          value={r.name_hi}
+                          onChange={(e) =>
+                            setUploadRows((prev) =>
+                              prev.map((x, idx) => (idx === i ? { ...x, name_hi: e.target.value } : x)),
+                            )
+                          }
+                          className="h-8"
+                        />
+                      </TableCell>
+                      <TableCell className="font-mono text-sm">{r.number}</TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </div>
+            <DialogFooter>
+              <Button variant="outline" onClick={() => setUploadOpen(false)} disabled={importing}>
+                Cancel
+              </Button>
+              <Button onClick={handleImport} disabled={importing || transliterating}>
+                {importing ? (
+                  <>
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" /> Importing…
+                  </>
+                ) : (
+                  <>Import {uploadRows.length} row{uploadRows.length === 1 ? "" : "s"}</>
+                )}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      </div>
+    </DashboardLayout>
+  );
+}
+
+function normalizePhone(p: string): string {
+  const t = p.trim();
+  if (!t) return "";
+  if (t.startsWith("+")) return t;
+  const digits = t.replace(/\D/g, "");
+  if (digits.startsWith("91") && digits.length === 12) return `+${digits}`;
+  if (digits.length === 10) return `+91${digits}`;
+  return t;
+}
+
+function fmt(min: number): string {
+  if (!Number.isFinite(min)) return "00:00";
+  const h = Math.floor(min / 60);
+  const m = min % 60;
+  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+}
+
+function parseTimeToMinutes(v: string): number {
+  const [h, m] = v.split(":").map(Number);
+  return (Number.isFinite(h) ? h : 0) * 60 + (Number.isFinite(m) ? m : 0);
+}
+
+function istMinutesNow(): number {
+  const now = new Date();
+  const utcMin = now.getUTCHours() * 60 + now.getUTCMinutes();
+  return (utcMin + 5 * 60 + 30) % (24 * 60);
+}

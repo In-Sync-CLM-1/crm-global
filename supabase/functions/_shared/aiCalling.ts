@@ -1,6 +1,7 @@
 // Shared helpers for AI calling: working-window gate, Bolna agent provisioning, call dispatch.
 
 export const INSYNC_DEMO_ORG_ID = "61f7f96d-e80c-4d9b-a765-8eb32bd3c70d";
+export const IEDUP_ORG_ID = "6dcf4229-6902-4cd4-9c7f-2d6ed4a6045d";
 export const BOLNA = "https://api.bolna.ai";
 // Exotel "Agentic Call" ExoPhone — required as from_phone_number; Exotel routes channels automatically.
 export const DEFAULT_FROM_NUMBER = "+911169323462";
@@ -14,6 +15,44 @@ export const QUEUE_DEPTH = 25;
 export function getConcurrency(): number {
   const v = parseInt(Deno.env.get("AI_CONCURRENCY") ?? "1", 10);
   return Number.isFinite(v) && v >= 1 ? Math.min(v, 20) : 1;
+}
+
+export interface WindowSlot {
+  start_min: number;
+  end_min: number;
+}
+
+/**
+ * Org-aware window check. `windows` is an array of {start_min, end_min} entries
+ * in IST minutes since midnight. Sunday is always a no-call day across all orgs.
+ */
+export function isInsideCustomWindow(
+  windows: WindowSlot[] | null | undefined,
+  now: Date = new Date(),
+): { inside: boolean; reason: string } {
+  if (nowIstDayOfWeek(now) === 0) {
+    return { inside: false, reason: "Sunday — no calling" };
+  }
+  const list = Array.isArray(windows) ? windows : [];
+  if (list.length === 0) {
+    return { inside: false, reason: "no calling windows configured" };
+  }
+  const m = nowIstMinutesSinceMidnight(now);
+  for (const w of list) {
+    const s = Number(w?.start_min);
+    const e = Number(w?.end_min);
+    if (!Number.isFinite(s) || !Number.isFinite(e)) continue;
+    if (m >= s && m < e) {
+      return {
+        inside: true,
+        reason: `inside window ${formatIstMin(s)}-${formatIstMin(e)} IST`,
+      };
+    }
+  }
+  const summary = list
+    .map((w) => `${formatIstMin(Number(w.start_min))}-${formatIstMin(Number(w.end_min))}`)
+    .join(", ");
+  return { inside: false, reason: `outside configured windows (${summary}) IST` };
 }
 
 /**
@@ -193,7 +232,9 @@ export async function createBolnaAgent(bolnaKey: string, input: AgentCreateInput
               family: "openai",
               model: "gpt-4o-mini",
               temperature: 0.4,
-              max_tokens: 250,
+              // Cap responses tight so the AI stays in two-sentence territory
+              // and doesn't go on after the prospect agrees.
+              max_tokens: 150,
             },
           },
           transcriber: {
@@ -207,6 +248,9 @@ export async function createBolnaAgent(bolnaKey: string, input: AgentCreateInput
           synthesizer: {
             provider: "elevenlabs",
             stream: true,
+            // Bolna's default 40-char buffer is too small for ElevenLabs streaming
+            // — produces audible mid-sentence pauses on bursty LLM tokens.
+            buffer_size: 250,
             provider_config: {
               voice: script.voice_name || "Riya Rao - Professional Voice",
               voice_id: script.voice_id || "vYENaCJHl4vFKNDYPr8y",
@@ -249,6 +293,7 @@ export interface TriggerCallInput {
     id: string;
     first_name?: string | null;
     last_name?: string | null;
+    name_hi?: string | null;
     company?: string | null;
     job_title?: string | null;
   };
@@ -259,6 +304,12 @@ export async function triggerBolnaCall(
   bolnaKey: string,
   input: TriggerCallInput,
 ): Promise<{ execution_id?: string; error?: string }> {
+  // When name_hi is set, the Bolna agent's prompt is in Devanagari and the
+  // synthesizer needs the same script — pass name_hi as first_name so the
+  // LLM produces Hindi-pronunciation tokens for ElevenLabs.
+  const firstNameForBolna = input.contact.name_hi
+    ? input.contact.name_hi
+    : (input.contact.first_name ?? "");
   const callBody = {
     agent_id: input.agentId,
     recipient_phone_number: input.toNumber,
@@ -266,7 +317,7 @@ export async function triggerBolnaCall(
     user_data: {
       contact_id: input.contact.id,
       call_log_id: input.callLogId,
-      first_name: input.contact.first_name ?? "",
+      first_name: firstNameForBolna,
       last_name: input.contact.last_name ?? "",
       company: input.contact.company ?? "your company",
       job_title: input.contact.job_title ?? "",

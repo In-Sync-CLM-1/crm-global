@@ -80,6 +80,45 @@ const initialFormData: UserFormData = {
   designation_id: null,
 };
 
+async function ensureBillingOkForUserAdd(
+  orgId: string,
+): Promise<{ ok: boolean; reason: string }> {
+  // Fetch the org's subscription + active pricing in parallel
+  const [{ data: sub }, { data: pricing }] = await Promise.all([
+    supabase
+      .from("organization_subscriptions")
+      .select("subscription_status, next_billing_date, last_payment_date, wallet_balance, user_count")
+      .eq("org_id", orgId)
+      .maybeSingle(),
+    supabase
+      .from("subscription_pricing")
+      .select("per_user_monthly_cost")
+      .eq("is_active", true)
+      .maybeSingle(),
+  ]);
+
+  if (!sub) {
+    // No subscription row → allow (other guards handle this elsewhere)
+    return { ok: true, reason: "" };
+  }
+  if (sub.subscription_status !== "active") {
+    return { ok: false, reason: `Subscription is ${sub.subscription_status}. Please reactivate before adding users.` };
+  }
+  // Trial = no payment made yet AND next_billing_date is still in the future
+  const today = new Date().toISOString().slice(0, 10);
+  const inTrial = !sub.last_payment_date && sub.next_billing_date && sub.next_billing_date >= today;
+  if (inTrial) return { ok: true, reason: "" };
+
+  const seatCost = Number(pricing?.per_user_monthly_cost ?? 799);
+  const wallet = Number(sub.wallet_balance ?? 0);
+  if (wallet >= seatCost) return { ok: true, reason: "" };
+
+  return {
+    ok: false,
+    reason: `Trial has ended. Top up the wallet by at least ₹${seatCost.toFixed(0)} before adding a user.`,
+  };
+}
+
 export default function Users() {
   const [isInviteDialogOpen, setIsInviteDialogOpen] = useState(false);
   const [inviteLink, setInviteLink] = useState("");
@@ -191,6 +230,14 @@ export default function Users() {
       }
       if (!dialog.formData.password || !dialog.formData.password.trim()) {
         notification.error("Validation Error", "Password is required for new users");
+        return;
+      }
+
+      // Adding a user requires either an active trial or wallet credit to cover
+      // the next-cycle prorated charge. Org admins must top up before inviting.
+      const billingOk = await ensureBillingOkForUserAdd(effectiveOrgId);
+      if (!billingOk.ok) {
+        notification.error("Billing required", billingOk.reason);
         return;
       }
     }
