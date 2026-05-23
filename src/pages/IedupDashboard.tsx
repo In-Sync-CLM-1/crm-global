@@ -25,18 +25,23 @@ export default function IedupDashboard() {
   const { isLoading: orgLoading } = useIsIedup();
   const [topUpOpen, setTopUpOpen] = useState(false);
 
-  // Data counts
+  // Data counts (called = distinct contact_ids that appear in call_logs)
   const { data: dataCounts, refetch: refetchData } = useQuery({
     queryKey: ["iedup-data-counts"],
     queryFn: async () => {
-      const [total, called, dnc] = await Promise.all([
+      const [total, dnc, calledRows] = await Promise.all([
         supabase.from("contacts").select("id", { count: "exact", head: true }).eq("org_id", IEDUP_ORG_ID),
-        supabase.from("contacts").select("id", { count: "exact", head: true }).eq("org_id", IEDUP_ORG_ID).not("last_contacted_at", "is", null),
         supabase.from("contacts").select("id", { count: "exact", head: true }).eq("org_id", IEDUP_ORG_ID).eq("do_not_call", true),
+        supabase
+          .from("call_logs")
+          .select("contact_id")
+          .eq("org_id", IEDUP_ORG_ID)
+          .not("contact_id", "is", null)
+          .not("started_at", "is", null),
       ]);
       const totalN = total.count || 0;
-      const calledN = called.count || 0;
       const dncN = dnc.count || 0;
+      const calledN = new Set((calledRows.data || []).map((r: any) => r.contact_id)).size;
       return { total: totalN, called: calledN, pending: Math.max(0, totalN - calledN - dncN), dnc: dncN };
     },
     refetchInterval: REFRESH_MS,

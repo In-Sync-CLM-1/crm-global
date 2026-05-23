@@ -52,8 +52,8 @@ interface BeneficiaryRow {
   name_hi: string | null;
   phone: string | null;
   do_not_call: boolean | null;
-  last_contacted_at: string | null;
   status: string | null;
+  last_call_at?: string | null;
 }
 
 interface UploadRow {
@@ -81,17 +81,34 @@ export default function IedupPipeline() {
     },
   });
 
-  // Beneficiaries list
+  // Beneficiaries list (with last_call_at derived from call_logs)
   const { data: beneficiaries, refetch: refetchList } = useQuery({
     queryKey: ["iedup-beneficiaries"],
     queryFn: async () => {
       const { data, error } = await supabase
         .from("contacts")
-        .select("id, first_name, last_name, name_hi, phone, do_not_call, last_contacted_at, status")
+        .select("id, first_name, last_name, name_hi, phone, do_not_call, status")
         .eq("org_id", IEDUP_ORG_ID)
         .order("created_at", { ascending: false });
       if (error) throw error;
-      return (data || []) as BeneficiaryRow[];
+      const rows = (data || []) as BeneficiaryRow[];
+      if (rows.length === 0) return rows;
+
+      const ids = rows.map((r) => r.id);
+      const { data: calls } = await supabase
+        .from("call_logs")
+        .select("contact_id, started_at")
+        .eq("org_id", IEDUP_ORG_ID)
+        .in("contact_id", ids)
+        .not("started_at", "is", null)
+        .order("started_at", { ascending: false });
+
+      const latest = new Map<string, string>();
+      for (const c of calls || []) {
+        const cid = (c as any).contact_id as string;
+        if (cid && !latest.has(cid)) latest.set(cid, (c as any).started_at as string);
+      }
+      return rows.map((r) => ({ ...r, last_call_at: latest.get(r.id) ?? null }));
     },
     refetchInterval: 30_000,
   });
@@ -492,14 +509,14 @@ export default function IedupPipeline() {
                         <TableCell>
                           {b.do_not_call ? (
                             <Badge variant="destructive">Do not call</Badge>
-                          ) : b.last_contacted_at ? (
+                          ) : b.last_call_at ? (
                             <Badge variant="secondary">Called</Badge>
                           ) : (
                             <Badge variant="outline">Pending</Badge>
                           )}
                         </TableCell>
                         <TableCell className="text-xs text-muted-foreground">
-                          {b.last_contacted_at ? new Date(b.last_contacted_at).toLocaleString() : "—"}
+                          {b.last_call_at ? new Date(b.last_call_at).toLocaleString() : "—"}
                         </TableCell>
                         <TableCell className="text-right">
                           <div className="flex justify-end gap-1">
