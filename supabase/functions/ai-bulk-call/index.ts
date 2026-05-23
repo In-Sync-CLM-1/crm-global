@@ -65,6 +65,81 @@ serve(async (req) => {
     return done(200, { ok: true, org_id: targetOrgId, dialing_active: action === "start" });
   }
 
+  // Bulk-enqueue: caller (UI) passes a list of contact_ids; we insert queued
+  // call_logs rows for them and immediately trigger the cron path so dialing
+  // starts right away (subject to window + dialing_active + wallet checks).
+  if (action === "enqueue") {
+    const orgId = (body?.org_id as string) || INSYNC_DEMO_ORG_ID;
+    const contactIds = Array.isArray(body?.contact_ids) ? (body.contact_ids as string[]) : [];
+    if (contactIds.length === 0) return done(400, { ok: false, error: "contact_ids required" });
+
+    const { data: scripts } = await supabase
+      .from("ai_call_scripts")
+      .select("*")
+      .eq("org_id", orgId)
+      .eq("is_active", true);
+    if (!scripts || scripts.length === 0) {
+      return done(404, { ok: false, error: "no active ai_call_scripts for this org" });
+    }
+    const script = (scripts as ScriptRow[]).find((s) => s.id === body?.script_id) ?? (scripts[0] as ScriptRow);
+
+    const { data: contacts } = await supabase
+      .from("contacts")
+      .select("id, phone, do_not_call")
+      .eq("org_id", orgId)
+      .in("id", contactIds);
+    const valid = (contacts || []).filter((c: any) => c.phone && !c.do_not_call);
+    if (valid.length === 0) return done(200, { ok: true, queued: 0, reason: "no valid contacts" });
+
+    const { data: maxRow } = await supabase
+      .from("call_logs")
+      .select("bolna_queue_position")
+      .eq("org_id", orgId)
+      .eq("caller_type", "ai")
+      .eq("ai_script_id", script.id)
+      .order("bolna_queue_position", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    const startPos = ((maxRow?.bolna_queue_position as number) || 0) + 1;
+    const batchId = crypto.randomUUID();
+
+    const rows = valid.map((c: any, idx: number) => ({
+      org_id: orgId,
+      contact_id: c.id,
+      caller_type: "ai",
+      ai_script_id: script.id,
+      status: "queued",
+      call_type: "outbound",
+      direction: "outbound",
+      from_number: "+911169323462",
+      to_number: normalizePhone(c.phone),
+      bolna_batch_id: batchId,
+      bolna_queue_position: startPos + idx,
+      created_at: new Date().toISOString(),
+    }));
+
+    const { data: inserted, error: insErr } = await supabase
+      .from("call_logs")
+      .insert(rows)
+      .select("id");
+    if (insErr) return done(500, { ok: false, error: insErr.message });
+
+    // Auto-enable dialing for the org so the cron picks up the new queue
+    await supabase
+      .from("organization_settings")
+      .upsert(
+        { org_id: orgId, dialing_active: true, updated_at: new Date().toISOString() },
+        { onConflict: "org_id" },
+      );
+
+    return done(200, {
+      ok: true,
+      queued: (inserted || []).length,
+      batch_id: batchId,
+      skipped: contactIds.length - valid.length,
+    });
+  }
+
   if (action === "test_call") {
     const orgId = (body?.org_id as string) || INSYNC_DEMO_ORG_ID;
     const phone = body?.phone as string;

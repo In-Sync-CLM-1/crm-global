@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { Label } from "@/components/ui/label";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   Table,
   TableBody,
@@ -53,6 +54,7 @@ interface BeneficiaryRow {
   phone: string | null;
   do_not_call: boolean | null;
   status: string | null;
+  created_at: string | null;
   last_call_at?: string | null;
 }
 
@@ -87,7 +89,7 @@ export default function IedupPipeline() {
     queryFn: async () => {
       const { data, error } = await supabase
         .from("contacts")
-        .select("id, first_name, last_name, name_hi, phone, do_not_call, status")
+        .select("id, first_name, last_name, name_hi, phone, do_not_call, status, created_at")
         .eq("org_id", IEDUP_ORG_ID)
         .order("created_at", { ascending: false });
       if (error) throw error;
@@ -127,6 +129,13 @@ export default function IedupPipeline() {
   const [manualNumber, setManualNumber] = useState("");
   const [manualTransliterating, setManualTransliterating] = useState(false);
   const [manualSaving, setManualSaving] = useState(false);
+
+  // Filter + selection state
+  const [filterFrom, setFilterFrom] = useState<string>("");
+  const [filterTo, setFilterTo] = useState<string>("");
+  const [hideCalled, setHideCalled] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [bulkDialing, setBulkDialing] = useState(false);
 
   // Calling window editor state
   const [windowsDraft, setWindowsDraft] = useState<WindowSlot[]>([]);
@@ -318,6 +327,80 @@ export default function IedupPipeline() {
     }
   }
 
+  // Derived: filtered beneficiaries (by upload date and call status)
+  const filteredBeneficiaries = useMemo(() => {
+    const all = beneficiaries || [];
+    return all.filter((b) => {
+      if (filterFrom && b.created_at && b.created_at.slice(0, 10) < filterFrom) return false;
+      if (filterTo && b.created_at && b.created_at.slice(0, 10) > filterTo) return false;
+      if (hideCalled && b.last_call_at) return false;
+      return true;
+    });
+  }, [beneficiaries, filterFrom, filterTo, hideCalled]);
+
+  // Prune selection of rows that no longer match the filter
+  useEffect(() => {
+    const visibleIds = new Set(filteredBeneficiaries.map((b) => b.id));
+    setSelectedIds((prev) => {
+      const next = new Set<string>();
+      for (const id of prev) if (visibleIds.has(id)) next.add(id);
+      return next;
+    });
+  }, [filteredBeneficiaries]);
+
+  const allFilteredSelected =
+    filteredBeneficiaries.length > 0 && filteredBeneficiaries.every((b) => selectedIds.has(b.id));
+  const someFilteredSelected =
+    !allFilteredSelected && filteredBeneficiaries.some((b) => selectedIds.has(b.id));
+
+  function toggleAll() {
+    if (allFilteredSelected) {
+      setSelectedIds(new Set());
+    } else {
+      setSelectedIds(new Set(filteredBeneficiaries.map((b) => b.id)));
+    }
+  }
+  function toggleOne(id: string) {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+  function clearFilters() {
+    setFilterFrom("");
+    setFilterTo("");
+    setHideCalled(false);
+  }
+
+  async function dialSelected() {
+    const ids = Array.from(selectedIds);
+    if (ids.length === 0) return;
+    setBulkDialing(true);
+    try {
+      const { data, error } = await supabase.functions.invoke("ai-bulk-call", {
+        body: { action: "enqueue", org_id: IEDUP_ORG_ID, contact_ids: ids },
+      });
+      if (error) throw error;
+      const queued = (data as any)?.queued ?? 0;
+      const skipped = (data as any)?.skipped ?? 0;
+      notify.success(
+        "Calls queued",
+        `${queued} contact${queued === 1 ? "" : "s"} queued${skipped > 0 ? ` (${skipped} skipped — no phone or marked do-not-call)` : ""}.`,
+      );
+      // Kick off an immediate cron tick so dialing starts inside the calling window
+      supabase.functions.invoke("ai-bulk-call", { body: {} }).catch(() => undefined);
+      setSelectedIds(new Set());
+      qc.invalidateQueries({ queryKey: ["iedup-org-settings"] });
+      refetchList();
+    } catch (err: any) {
+      notify.error("Could not queue calls", err.message || "Try again.");
+    } finally {
+      setBulkDialing(false);
+    }
+  }
+
   async function deleteRow(row: BeneficiaryRow) {
     if (!confirm(`Delete ${row.first_name || row.phone}? This cannot be undone.`)) return;
     try {
@@ -476,36 +559,123 @@ export default function IedupPipeline() {
 
         {/* Beneficiaries table */}
         <Card>
-          <CardHeader>
+          <CardHeader className="space-y-3">
             <CardTitle className="text-base flex items-center justify-between">
               <span>Beneficiaries</span>
-              <Badge variant="secondary">{beneficiaries?.length ?? 0}</Badge>
+              <Badge variant="secondary">
+                {filteredBeneficiaries.length}
+                {beneficiaries && filteredBeneficiaries.length !== beneficiaries.length
+                  ? ` of ${beneficiaries.length}`
+                  : ""}
+              </Badge>
             </CardTitle>
+            <div className="flex flex-wrap items-end gap-3">
+              <div>
+                <Label htmlFor="from" className="text-xs">Uploaded from</Label>
+                <Input
+                  id="from"
+                  type="date"
+                  value={filterFrom}
+                  onChange={(e) => setFilterFrom(e.target.value)}
+                  className="h-8 w-40"
+                />
+              </div>
+              <div>
+                <Label htmlFor="to" className="text-xs">Uploaded to</Label>
+                <Input
+                  id="to"
+                  type="date"
+                  value={filterTo}
+                  onChange={(e) => setFilterTo(e.target.value)}
+                  className="h-8 w-40"
+                />
+              </div>
+              <label className="flex items-center gap-2 text-sm">
+                <Checkbox
+                  checked={hideCalled}
+                  onCheckedChange={(v) => setHideCalled(!!v)}
+                />
+                Hide already-called
+              </label>
+              {(filterFrom || filterTo || hideCalled) && (
+                <Button variant="ghost" size="sm" onClick={clearFilters}>
+                  Clear filters
+                </Button>
+              )}
+              <div className="ml-auto flex items-center gap-2">
+                {selectedIds.size > 0 && (
+                  <>
+                    <span className="text-sm text-muted-foreground">
+                      {selectedIds.size} selected
+                    </span>
+                    <Button
+                      size="sm"
+                      onClick={dialSelected}
+                      disabled={bulkDialing}
+                    >
+                      {bulkDialing ? (
+                        <>
+                          <Loader2 className="mr-2 h-4 w-4 animate-spin" /> Queuing…
+                        </>
+                      ) : (
+                        <>
+                          <Phone className="mr-2 h-4 w-4" />
+                          Call selected ({selectedIds.size})
+                        </>
+                      )}
+                    </Button>
+                  </>
+                )}
+              </div>
+            </div>
           </CardHeader>
           <CardContent>
             {(!beneficiaries || beneficiaries.length === 0) ? (
               <p className="text-sm text-muted-foreground">
-                No beneficiaries yet. Click "Upload CSV" to add some.
+                No beneficiaries yet. Click "Add beneficiary" or "Upload CSV" to add some.
+              </p>
+            ) : filteredBeneficiaries.length === 0 ? (
+              <p className="text-sm text-muted-foreground">
+                No rows match the current filter. <Button variant="link" className="h-auto p-0" onClick={clearFilters}>Clear filters</Button>
               </p>
             ) : (
               <div className="overflow-x-auto">
                 <Table>
                   <TableHeader>
                     <TableRow>
+                      <TableHead className="w-8">
+                        <Checkbox
+                          checked={allFilteredSelected ? true : someFilteredSelected ? "indeterminate" : false}
+                          onCheckedChange={toggleAll}
+                          aria-label="Select all visible rows"
+                        />
+                      </TableHead>
                       <TableHead>Name (EN)</TableHead>
                       <TableHead>Name (HI)</TableHead>
                       <TableHead>Number</TableHead>
+                      <TableHead>Uploaded</TableHead>
                       <TableHead>Status</TableHead>
                       <TableHead>Last call</TableHead>
                       <TableHead className="text-right">Actions</TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {beneficiaries.map((b) => (
-                      <TableRow key={b.id}>
+                    {filteredBeneficiaries.map((b) => (
+                      <TableRow key={b.id} data-state={selectedIds.has(b.id) ? "selected" : undefined}>
+                        <TableCell>
+                          <Checkbox
+                            checked={selectedIds.has(b.id)}
+                            onCheckedChange={() => toggleOne(b.id)}
+                            disabled={!b.phone || b.do_not_call === true}
+                            aria-label={`Select ${b.first_name || b.phone}`}
+                          />
+                        </TableCell>
                         <TableCell>{[b.first_name, b.last_name].filter(Boolean).join(" ")}</TableCell>
                         <TableCell className="font-medium">{b.name_hi || "—"}</TableCell>
                         <TableCell className="font-mono text-sm">{b.phone}</TableCell>
+                        <TableCell className="text-xs text-muted-foreground">
+                          {b.created_at ? new Date(b.created_at).toLocaleDateString() : "—"}
+                        </TableCell>
                         <TableCell>
                           {b.do_not_call ? (
                             <Badge variant="destructive">Do not call</Badge>
