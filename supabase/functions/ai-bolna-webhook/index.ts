@@ -31,13 +31,10 @@ const POST_CALL_WA_BY_ORG: Record<string, {
   body_params: (ctx: { firstName: string }) => string[];
 }> = {
   "6dcf4229-6902-4cd4-9c7f-2d6ed4a6045d": {
-    template_name: "iedup_cmyuva_training_link",
+    template_name: "iedup_cmyuva_training_link_v2",
     language_code: "hi",
     from_number: "+918808359820",
-    body_params: ({ firstName }) => [
-      firstName,
-      "https://cmyuva.iedup.co.in/registration_form.php",
-    ],
+    body_params: ({ firstName }) => [firstName],
   },
 };
 
