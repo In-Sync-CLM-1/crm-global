@@ -242,45 +242,54 @@ Deno.serve(async (req) => {
         const messageStatus = mapExotelStatus(exo_status_code);
         const timestampDate = new Date(timestamp);
 
-        // Find the message by exotel_message_id
-        const { data: message, error: fetchError } = await supabaseClient
+        // (a) Conversation log — whatsapp_messages (most orgs' chat view)
+        const { data: message } = await supabaseClient
           .from('whatsapp_messages')
-          .select('*')
+          .select('id, delivered_at')
           .eq('exotel_message_id', sid)
-          .single();
+          .maybeSingle();
 
-        if (fetchError || !message) {
-          console.error('Message not found for SID:', sid, fetchError);
-          continue;
-        }
-
-        // Prepare update data based on status
-        const updateData: any = { 
-          status: messageStatus,
-          exotel_status_code: exo_status_code.toString(),
-        };
-
-        if (messageStatus === 'delivered' || messageStatus === 'sent') {
-          updateData.delivered_at = timestampDate.toISOString();
-        } else if (messageStatus === 'read') {
-          updateData.read_at = timestampDate.toISOString();
-          if (!message.delivered_at) {
+        if (message) {
+          const updateData: any = {
+            status: messageStatus,
+            exotel_status_code: exo_status_code.toString(),
+          };
+          if (messageStatus === 'delivered' || messageStatus === 'sent') {
             updateData.delivered_at = timestampDate.toISOString();
+          } else if (messageStatus === 'read') {
+            updateData.read_at = timestampDate.toISOString();
+            if (!message.delivered_at) updateData.delivered_at = timestampDate.toISOString();
+          } else if (messageStatus === 'failed') {
+            updateData.error_message = `${exo_detailed_status}: ${description}`;
           }
-        } else if (messageStatus === 'failed') {
-          updateData.error_message = `${exo_detailed_status}: ${description}`;
+          await supabaseClient.from('whatsapp_messages').update(updateData).eq('id', message.id);
         }
 
-        // Update the message status
-        const { error: updateError } = await supabaseClient
-          .from('whatsapp_messages')
-          .update(updateData)
-          .eq('id', message.id);
+        // (b) Billing/usage log — whatsapp_logs (IEDUP dashboard + stage-action
+        // and post-call sends). Advance sent -> delivered -> read so the
+        // dashboard funnel and the disposition column reflect real status.
+        const { data: waLog } = await supabaseClient
+          .from('whatsapp_logs')
+          .select('id, delivered_at')
+          .eq('exotel_msg_sid', sid)
+          .maybeSingle();
 
-        if (updateError) {
-          console.error('Error updating message:', updateError);
-        } else {
-          console.log(`Updated message ${message.id} to status: ${messageStatus}`);
+        if (waLog) {
+          const logUpd: any = { status: messageStatus };
+          if (messageStatus === 'delivered') {
+            logUpd.delivered_at = timestampDate.toISOString();
+          } else if (messageStatus === 'read') {
+            logUpd.read_at = timestampDate.toISOString();
+            if (!waLog.delivered_at) logUpd.delivered_at = timestampDate.toISOString();
+          } else if (messageStatus === 'failed') {
+            logUpd.failed_at = timestampDate.toISOString();
+            logUpd.error_text = `${exo_detailed_status}: ${description}`;
+          }
+          await supabaseClient.from('whatsapp_logs').update(logUpd).eq('id', waLog.id);
+        }
+
+        if (!message && !waLog) {
+          console.error('DLR: no whatsapp_messages or whatsapp_logs row for SID:', sid);
         }
       }
     }

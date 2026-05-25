@@ -83,7 +83,7 @@ select ps.org_id, ps.id,
   case when ps.name = 'Call' then 'call' else 'whatsapp' end,
   case ps.name
     when 'Send WhatsApp - After certificate' then 'iedup_cmyuva_certificate_ready_v1'
-    when 'Send WhatsApp - After registration & payment verification' then 'iedup_cmyuva_registration_steps_v1'
+    when 'Send WhatsApp - After registration & payment verification' then 'iedup_cmyuva_registration_steps_v2'
     when 'Send WhatsApp - Payment failed' then 'iedup_cmyuva_payment_failed_v1'
     when 'Send WhatsApp - Add help desk number' then 'iedup_cmyuva_training_helpdesk_v1'
     when 'Send WhatsApp - Photo rejected' then 'iedup_cmyuva_photo_reupload_v1'

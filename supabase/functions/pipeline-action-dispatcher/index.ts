@@ -26,6 +26,8 @@ const WA_SENDER_BY_ORG: Record<string, string> = {
 
 // How many of each action to fire per org per tick.
 const MAX_WA_PER_TICK = 25;
+// Exotel WhatsApp utility-template price (₹ per message). Matches the post-call sender.
+const WHATSAPP_UTILITY_COST_PER_MSG = 0.20;
 function callConcurrency(): number {
   const v = parseInt(Deno.env.get("PIPELINE_CALL_CONCURRENCY") ?? "3", 10);
   return Number.isFinite(v) && v >= 1 ? Math.min(v, 20) : 3;
@@ -178,6 +180,9 @@ async function processOrg(supabase: any, orgId: string): Promise<unknown> {
 }
 
 // ---- WhatsApp send ----------------------------------------------------------
+// Logs to whatsapp_logs (the billing/usage table the IEDUP dashboard reads and
+// the DLR webhook advances) and charges the wallet — same path as the post-call
+// sender. Recipient is digits-with-country-code, no '+', as that path proved out.
 async function sendWhatsAppTemplate(
   supabase: any,
   args: { orgId: string; sender: string; contact: any; phone: string; row: QueueRow },
@@ -191,13 +196,30 @@ async function sendWhatsAppTemplate(
     return { ok: false, error: "Exotel WA creds/sender not configured" };
   }
 
+  const cleanTo = phone.replace(/^\+/, "").replace(/^0+/, "");
+
   // Only the help-desk template carries a {{1}} name variable; the rest are generic.
   const name = contact.name_hi || contact.first_name || "प्रतिभागी";
   const params: string[] = row.template_name === "iedup_cmyuva_training_helpdesk_v1" ? [name] : [];
-
   const components = params.length > 0
     ? [{ type: "body", parameters: params.map((p) => ({ type: "text", text: p })) }]
     : [];
+
+  // Pre-insert a queued row so the dashboard sees the attempt immediately.
+  const { data: waLogRow } = await supabase
+    .from("whatsapp_logs")
+    .insert({
+      org_id: orgId,
+      contact_id: row.contact_id,
+      to_number: cleanTo,
+      template_name: row.template_name,
+      language_code: row.language_code || "hi",
+      body_params: params,
+      status: "queued",
+    })
+    .select("id")
+    .single();
+  const waLogId = waLogRow?.id as string | undefined;
 
   const callbackUrl = `${Deno.env.get("SUPABASE_URL")}/functions/v1/whatsapp-webhook`;
   const payload = {
@@ -206,7 +228,7 @@ async function sendWhatsAppTemplate(
     whatsapp: {
       messages: [{
         from: sender,
-        to: phone,
+        to: cleanTo,
         content: {
           type: "template",
           template: {
@@ -231,31 +253,109 @@ async function sendWhatsAppTemplate(
     respText = await resp.text();
     httpOk = resp.ok;
   } catch (e: any) {
+    if (waLogId) {
+      await supabase.from("whatsapp_logs")
+        .update({ status: "failed", failed_at: new Date().toISOString(), error_text: `fetch failed: ${String(e?.message || e)}` })
+        .eq("id", waLogId);
+    }
     return { ok: false, error: `fetch failed: ${e?.message || e}` };
   }
 
   let exoSid: string | null = null;
   try {
     const j = JSON.parse(respText);
-    exoSid = j?.response?.whatsapp?.messages?.[0]?.data?.sid || null;
+    const msgResp = j?.response?.whatsapp?.messages?.[0];
+    exoSid = msgResp?.data?.sid || null;
+    httpOk = httpOk && (msgResp?.code === 200 || msgResp?.code === 202);
   } catch { /* keep raw */ }
 
-  // Log so the DLR webhook can walk it Sent -> Delivered -> Opened.
-  await supabase.from("whatsapp_messages").insert({
-    org_id: orgId,
-    contact_id: row.contact_id,
-    conversation_id: phone,
-    direction: "outbound",
-    phone_number: phone,
-    message_content: row.template_name,
-    exotel_message_id: exoSid,
-    status: httpOk ? "sent" : "failed",
-    sent_at: new Date().toISOString(),
-    error_message: httpOk ? null : respText.slice(0, 500),
-  });
+  if (httpOk && waLogId) {
+    await supabase.from("whatsapp_logs")
+      .update({
+        status: "sent",
+        sent_at: new Date().toISOString(),
+        exotel_msg_sid: exoSid,
+        cost_charged: WHATSAPP_UTILITY_COST_PER_MSG,
+      })
+      .eq("id", waLogId);
+    await recordUsage(supabase, {
+      orgId,
+      serviceType: "whatsapp",
+      referenceId: waLogId,
+      quantity: 1,
+      cost: WHATSAPP_UTILITY_COST_PER_MSG,
+      description: `WhatsApp utility template ${row.template_name} → ${cleanTo}`,
+    });
+    return { ok: true };
+  }
 
-  if (!httpOk) return { ok: false, error: respText.slice(0, 300) };
-  return { ok: true };
+  if (waLogId) {
+    await supabase.from("whatsapp_logs")
+      .update({ status: "failed", failed_at: new Date().toISOString(), error_text: respText.slice(0, 500) })
+      .eq("id", waLogId);
+  }
+  return { ok: false, error: respText.slice(0, 300) };
+}
+
+// Records a usage row and atomically decrements the org's wallet. Idempotent on
+// (service_type, reference_id). Mirrors recordUsage in ai-bolna-webhook.
+async function recordUsage(
+  supabase: any,
+  args: { orgId: string; serviceType: "call" | "whatsapp" | "email"; referenceId: string; quantity: number; cost: number; description: string },
+): Promise<void> {
+  try {
+    const { data: existing } = await supabase
+      .from("service_usage_logs")
+      .select("id")
+      .eq("org_id", args.orgId)
+      .eq("service_type", args.serviceType)
+      .eq("reference_id", args.referenceId)
+      .maybeSingle();
+    if (existing) return;
+
+    const { data: usageRow } = await supabase
+      .from("service_usage_logs")
+      .insert({ org_id: args.orgId, service_type: args.serviceType, reference_id: args.referenceId, quantity: args.quantity, cost: args.cost, wallet_deducted: false })
+      .select("id")
+      .single();
+    if (!usageRow) return;
+
+    const { data: sub } = await supabase
+      .from("organization_subscriptions")
+      .select("wallet_balance")
+      .eq("org_id", args.orgId)
+      .maybeSingle();
+    if (!sub) return;
+
+    const balanceBefore = Number(sub.wallet_balance || 0);
+    const balanceAfter = balanceBefore - args.cost;
+
+    const { data: walletTxn } = await supabase
+      .from("wallet_transactions")
+      .insert({
+        org_id: args.orgId,
+        transaction_type: `deduction_${args.serviceType}`,
+        amount: -args.cost,
+        balance_before: balanceBefore,
+        balance_after: balanceAfter,
+        reference_id: args.referenceId,
+        reference_type: args.serviceType,
+        quantity: args.quantity,
+        unit_cost: args.cost / Math.max(1, args.quantity),
+        description: args.description,
+      })
+      .select("id")
+      .single();
+
+    await supabase.from("organization_subscriptions")
+      .update({ wallet_balance: balanceAfter, updated_at: new Date().toISOString() })
+      .eq("org_id", args.orgId);
+    await supabase.from("service_usage_logs")
+      .update({ wallet_deducted: true, wallet_transaction_id: walletTxn?.id })
+      .eq("id", usageRow.id);
+  } catch (e) {
+    console.error("recordUsage exception:", String(e));
+  }
 }
 
 // ---- AI call trigger --------------------------------------------------------
