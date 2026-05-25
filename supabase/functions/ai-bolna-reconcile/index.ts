@@ -78,10 +78,23 @@ serve(async (req) => {
       const telephony = (exec.telephony_data as Record<string, unknown>) || {};
       const telDur = telephony.duration != null ? Number(telephony.duration) : null;
       const convDur = exec.conversation_duration != null ? Number(exec.conversation_duration) : null;
-      const dur = telDur ?? convDur;
+      let dur = telDur ?? convDur;
       const recordingUrl = (telephony.recording_url as string) || null;
       const providerCallSid = (telephony.provider_call_id as string) || null;
       const transcript = (exec.transcript as string) || null;
+
+      // Bolna frequently reports duration 0 even for calls that clearly had a
+      // real conversation (hangup_reason "inactivity_timeout"). When the
+      // transcript shows the callee actually spoke (a "user:" turn) but the
+      // reported duration is missing/0, fall back to the wall-clock span
+      // (initiated_at → updated_at) so the call is captured and billed.
+      if ((dur == null || dur === 0) && transcript && /(^|\n)\s*user\s*:/i.test(transcript)
+          && exec.initiated_at && exec.updated_at) {
+        const span = Math.round(
+          (new Date(exec.updated_at as string).getTime() - new Date(exec.initiated_at as string).getTime()) / 1000,
+        );
+        if (Number.isFinite(span) && span > 0 && span < 3600) dur = span;
+      }
 
       // Mirror the webhook's normalization rules (raw Bolna outcome — no threshold reclass).
       let normalizedStatus = rawStatus;
