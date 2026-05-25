@@ -32,13 +32,21 @@ Deno.serve(async (req) => {
       throw new Error('Unauthorized');
     }
 
+    // DB operations run with the service role so RLS on subscription_pricing /
+    // payment_transactions can't block order creation (the user is already
+    // authenticated above).
+    const db = createClient(
+      Deno.env.get('SUPABASE_URL') ?? '',
+      Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
+    );
+
     const body: OrderRequest = await req.json();
     const { org_id, amount, type, invoice_id, is_initial_payment, billing_period } = body;
 
     console.log('Creating Razorpay order:', { org_id, amount, type, invoice_id });
 
     // Get GST percentage from active pricing
-    const { data: pricing } = await supabase
+    const { data: pricing } = await db
       .from('subscription_pricing')
       .select('gst_percentage')
       .eq('is_active', true)
@@ -93,7 +101,7 @@ Deno.serve(async (req) => {
     console.log('Razorpay order created:', razorpayOrder.id);
 
     // Create payment transaction record
-    const { data: paymentTxn, error: txnError } = await supabase
+    const { data: paymentTxn, error: txnError } = await db
       .from('payment_transactions')
       .insert({
         org_id,

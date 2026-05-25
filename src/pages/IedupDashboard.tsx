@@ -88,12 +88,6 @@ export default function IedupDashboard() {
     refetchInterval: REFRESH_MS,
   });
 
-  const { data: sub } = useQuery({
-    queryKey: ["iedup-subscription"],
-    queryFn: async () => (await supabase.from("organization_subscriptions").select("*").eq("org_id", IEDUP_ORG_ID).maybeSingle()).data,
-    refetchInterval: REFRESH_MS,
-  });
-
   const { data: settings } = useQuery({
     queryKey: ["iedup-org-settings"],
     queryFn: async () => (await supabase.from("organization_settings").select("dialing_active, calling_windows, updated_at").eq("org_id", IEDUP_ORG_ID).maybeSingle()).data,
@@ -174,15 +168,14 @@ export default function IedupDashboard() {
 
   if (orgLoading) return <DashboardLayout><div className="p-6">Loading…</div></DashboardLayout>;
 
-  const trialDaysLeft = sub?.billing_cycle_start ? daysBetween(new Date(), new Date(sub.next_billing_date)) : null;
   const hasWaData = (waRows || []).length > 0;
   const hasCallData = (callRows || []).length > 0;
 
   return (
     <DashboardLayout>
-      <div className="space-y-3">
+      <div className="flex flex-col gap-3 lg:h-full lg:overflow-hidden">
         {/* Header */}
-        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex shrink-0 flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
           <div>
             <h1 className="text-2xl font-semibold tracking-tight">IEDUP Dashboard</h1>
             <p className="text-sm text-muted-foreground">CM YUVA training notifications — calls & WhatsApp at a glance.</p>
@@ -196,7 +189,7 @@ export default function IedupDashboard() {
         </div>
 
         {/* Headline KPIs */}
-        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
+        <div className="grid shrink-0 grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
           <KpiCard icon={<UsersIcon size={16} />} label="Beneficiaries" value={dataCounts?.total ?? "—"} tone="slate" />
           <KpiCard icon={<Clock size={16} />} label="Pending" value={dataCounts?.pending ?? "—"} tone="amber" />
           <KpiCard icon={<Send size={16} />} label="Messages sent" value={wa.sent} tone="blue" />
@@ -206,10 +199,10 @@ export default function IedupDashboard() {
         </div>
 
         {/* Primary trend + funnel */}
-        <div className="grid grid-cols-1 gap-3 lg:grid-cols-3">
+        <div className="grid grid-cols-1 gap-3 lg:min-h-0 lg:flex-1 lg:grid-cols-3">
           <ChartCard className="lg:col-span-2" title="WhatsApp outreach over time" subtitle="Sent → Delivered → Opened">
             {hasWaData ? (
-              <ResponsiveContainer width="100%" height={200}>
+              <ResponsiveContainer width="100%" height="100%">
                 <AreaChart data={trend} margin={{ top: 6, right: 8, left: -18, bottom: 0 }}>
                   <defs>
                     {(["sent", "delivered", "opened"] as const).map((k) => (
@@ -233,7 +226,7 @@ export default function IedupDashboard() {
           </ChartCard>
 
           <ChartCard title="Delivery funnel" subtitle="This period">
-            <div className="flex h-[200px] flex-col justify-center gap-3 px-1">
+            <div className="flex h-full flex-col justify-center gap-3 px-1">
               <FunnelBar label="Sent" value={wa.sent} total={wa.sent} color={C.sent} />
               <FunnelBar label="Delivered" value={wa.delivered} total={wa.sent} color={C.delivered} />
               <FunnelBar label="Opened" value={wa.opened} total={wa.sent} color={C.opened} />
@@ -242,10 +235,10 @@ export default function IedupDashboard() {
         </div>
 
         {/* Calls trend + by-template */}
-        <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
+        <div className="grid grid-cols-1 gap-3 lg:min-h-0 lg:flex-1 lg:grid-cols-2">
           <ChartCard title="Calls over time" subtitle="Placed vs Connected">
             {hasCallData ? (
-              <ResponsiveContainer width="100%" height={200}>
+              <ResponsiveContainer width="100%" height="100%">
                 <AreaChart data={trend} margin={{ top: 6, right: 8, left: -18, bottom: 0 }}>
                   <defs>
                     <linearGradient id="g-placed" x1="0" y1="0" x2="0" y2="1">
@@ -269,7 +262,7 @@ export default function IedupDashboard() {
 
           <ChartCard title="By message type" subtitle="Sent vs Opened">
             {byTemplate.length > 0 ? (
-              <ResponsiveContainer width="100%" height={200}>
+              <ResponsiveContainer width="100%" height="100%">
                 <BarChart data={byTemplate} layout="vertical" margin={{ top: 4, right: 12, left: 8, bottom: 0 }}>
                   <CartesianGrid horizontal={false} strokeDasharray="3 3" stroke="hsl(var(--border))" strokeOpacity={0.5} />
                   <XAxis type="number" tick={{ fontSize: 10 }} tickLine={false} axisLine={false} allowDecimals={false} />
@@ -284,20 +277,6 @@ export default function IedupDashboard() {
           </ChartCard>
         </div>
 
-        {/* Wallet strip */}
-        <Card className="border-0 bg-gradient-to-r from-muted/60 to-muted/20">
-          <CardContent className="flex flex-col gap-3 p-4 sm:flex-row sm:items-center sm:justify-between">
-            <div className="flex flex-wrap items-center gap-6 text-sm">
-              <div><p className="text-muted-foreground">Wallet balance</p><p className="text-lg font-semibold">₹{Number(sub?.wallet_balance ?? 0).toFixed(2)}</p></div>
-              <div><p className="text-muted-foreground">Trial / next billing</p><p className="text-lg font-semibold">{sub?.next_billing_date ? `${trialDaysLeft != null ? `${trialDaysLeft} days` : "—"} (${sub.next_billing_date})` : "—"}</p></div>
-              <div><p className="text-muted-foreground">Status</p><p className="text-lg font-semibold capitalize">{sub?.subscription_status || "—"}</p></div>
-            </div>
-            <div className="flex gap-2">
-              <Button asChild variant="outline" size="sm"><Link to="/pipeline">Manage queue</Link></Button>
-              <Button asChild size="sm"><Link to="/billing">Billing</Link></Button>
-            </div>
-          </CardContent>
-        </Card>
       </div>
     </DashboardLayout>
   );
@@ -329,12 +308,12 @@ function KpiCard({ icon, label, value, tone }: { icon: React.ReactNode; label: s
 
 function ChartCard({ title, subtitle, children, className = "" }: { title: string; subtitle?: string; children: React.ReactNode; className?: string }) {
   return (
-    <Card className={`p-4 ${className}`}>
-      <div className="mb-3">
+    <Card className={`flex flex-col p-4 ${className}`}>
+      <div className="mb-2 shrink-0">
         <h3 className="text-sm font-semibold">{title}</h3>
         {subtitle && <p className="text-[11px] text-muted-foreground">{subtitle}</p>}
       </div>
-      {children}
+      <div className="h-[180px] lg:h-auto lg:min-h-0 lg:flex-1">{children}</div>
     </Card>
   );
 }
@@ -391,7 +370,7 @@ const ChartTooltip = ({ active, payload, label }: any) => {
 };
 
 function Empty({ children }: { children: React.ReactNode }) {
-  return <div className="flex h-[200px] items-center justify-center text-xs text-muted-foreground">{children}</div>;
+  return <div className="flex h-full items-center justify-center text-xs text-muted-foreground">{children}</div>;
 }
 
 function daysBetween(a: Date, b: Date): number {

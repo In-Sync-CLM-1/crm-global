@@ -176,7 +176,7 @@ export function TopUpWalletDialog({ open, onOpenChange, orgId, minAmount = 500 }
             Top up wallet
           </DialogTitle>
           <DialogDescription>
-            AI calls deduct ₹3 per minute; WhatsApp utility messages deduct ₹0.20 each. Choose how much to add.
+            AI calls deduct ₹3 per minute; WhatsApp messages deduct ₹0.20 (utility) or ₹1 (marketing) each. Choose how much to add.
           </DialogDescription>
         </DialogHeader>
 

@@ -31,21 +31,28 @@ serve(async (req) => {
 
   let lookbackHours = 24;
   let maxRows = 200;
+  let orgFilter: string | null = null;
   try {
     const body = req.method === "POST" ? await req.json() : {};
     if (typeof body.lookback_hours === "number") lookbackHours = body.lookback_hours;
     if (typeof body.max_rows === "number") maxRows = body.max_rows;
+    if (typeof body.org_id === "string") orgFilter = body.org_id;
   } catch { /* defaults */ }
 
   const cutoff = new Date(Date.now() - lookbackHours * 3600 * 1000).toISOString();
 
-  // Rows worth re-checking: have a Bolna execution id, created in window, not yet completed.
-  const { data: rows, error } = await supabase
+  // Rows worth re-checking: have a Bolna execution id, created in window, and
+  // either not yet completed OR completed but missing a duration (the terminal
+  // webhook often arrives without one, so these never got their talk-time —
+  // which means they were never billed). Re-fetch them from Bolna to fill it in.
+  let q = supabase
     .from("call_logs")
     .select("id, bolna_execution_id, status, call_duration")
     .not("bolna_execution_id", "is", null)
     .gte("created_at", cutoff)
-    .neq("status", "completed")
+    .or("status.neq.completed,call_duration.is.null,call_duration.eq.0");
+  if (orgFilter) q = q.eq("org_id", orgFilter);
+  const { data: rows, error } = await q
     .order("created_at", { ascending: false })
     .limit(maxRows);
 

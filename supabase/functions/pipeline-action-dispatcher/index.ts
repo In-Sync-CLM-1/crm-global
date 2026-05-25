@@ -26,8 +26,18 @@ const WA_SENDER_BY_ORG: Record<string, string> = {
 
 // How many of each action to fire per org per tick.
 const MAX_WA_PER_TICK = 25;
-// Exotel WhatsApp utility-template price (₹ per message). Matches the post-call sender.
+// Exotel WhatsApp price per message (₹). Utility = ₹0.20, Marketing = ₹1.00.
 const WHATSAPP_UTILITY_COST_PER_MSG = 0.20;
+const WHATSAPP_MARKETING_COST_PER_MSG = 1.00;
+// Templates Meta classifies as MARKETING (charged at the marketing rate).
+const MARKETING_TEMPLATES = new Set<string>([
+  "iedup_cmyuva_registration_steps_v2",
+]);
+function waCostFor(templateName: string | null): number {
+  return templateName && MARKETING_TEMPLATES.has(templateName)
+    ? WHATSAPP_MARKETING_COST_PER_MSG
+    : WHATSAPP_UTILITY_COST_PER_MSG;
+}
 function callConcurrency(): number {
   const v = parseInt(Deno.env.get("PIPELINE_CALL_CONCURRENCY") ?? "3", 10);
   return Number.isFinite(v) && v >= 1 ? Math.min(v, 20) : 3;
@@ -270,12 +280,14 @@ async function sendWhatsAppTemplate(
   } catch { /* keep raw */ }
 
   if (httpOk && waLogId) {
+    const cost = waCostFor(row.template_name);
+    const category = MARKETING_TEMPLATES.has(row.template_name || "") ? "marketing" : "utility";
     await supabase.from("whatsapp_logs")
       .update({
         status: "sent",
         sent_at: new Date().toISOString(),
         exotel_msg_sid: exoSid,
-        cost_charged: WHATSAPP_UTILITY_COST_PER_MSG,
+        cost_charged: cost,
       })
       .eq("id", waLogId);
     await recordUsage(supabase, {
@@ -283,8 +295,8 @@ async function sendWhatsAppTemplate(
       serviceType: "whatsapp",
       referenceId: waLogId,
       quantity: 1,
-      cost: WHATSAPP_UTILITY_COST_PER_MSG,
-      description: `WhatsApp utility template ${row.template_name} → ${cleanTo}`,
+      cost,
+      description: `WhatsApp ${category} template ${row.template_name} → ${cleanTo}`,
     });
     return { ok: true };
   }

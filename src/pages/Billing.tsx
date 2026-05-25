@@ -212,7 +212,7 @@ export default function Billing() {
           <CardContent className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <div className="text-sm text-muted-foreground">
               Balance <span className="text-lg font-semibold text-foreground">{inr(balance)}</span>
-              <p className="mt-1 text-xs">New accounts start with ₹100 free credit for testing. AI calls deduct ₹3/min; WhatsApp utility messages ₹0.20 each.</p>
+              <p className="mt-1 text-xs">New accounts start with ₹100 free credit for testing. AI calls deduct ₹3/min; WhatsApp messages deduct ₹0.20 (utility) or ₹1 (marketing) each.</p>
             </div>
             <Button variant="outline" onClick={() => setTopUpOpen(true)} className="gap-2"><IndianRupee className="h-4 w-4" /> Add funds</Button>
           </CardContent>
