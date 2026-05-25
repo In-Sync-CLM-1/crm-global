@@ -82,11 +82,24 @@ export default function SDRAttendanceReport() {
   const { data: profiles = [], isLoading: profilesLoading } = useQuery({
     queryKey: ["sdr-profiles", effectiveOrgId, designationFilter],
     queryFn: async () => {
+      // Only expect attendance from people who are active members of THIS org.
+      // Org membership lives in user_roles; relying on profiles.is_active alone
+      // lets a removed user reappear if the two flags ever drift out of sync.
+      const { data: roles, error: rolesError } = await supabase
+        .from("user_roles")
+        .select("user_id")
+        .eq("org_id", effectiveOrgId!)
+        .eq("is_active", true);
+      if (rolesError) throw rolesError;
+      const activeMemberIds = (roles ?? []).map((r) => r.user_id);
+      if (activeMemberIds.length === 0) return [];
+
       let query = supabase
         .from("profiles")
         .select("id, first_name, last_name, email, designation_id")
         .eq("org_id", effectiveOrgId!)
-        .eq("is_active", true);
+        .eq("is_active", true)
+        .in("id", activeMemberIds);
       if (designationFilter !== "ALL") {
         const desig = designations.find((d) => d.name === designationFilter);
         if (desig) query = query.eq("designation_id", desig.id);
