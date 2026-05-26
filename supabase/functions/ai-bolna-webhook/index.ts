@@ -6,7 +6,7 @@ import {
   BILLABLE_CALL_ORG_IDS,
   INSYNC_DEMO_ORG_ID,
 } from "../_shared/aiCalling.ts";
-import { classifyCall, applyDisposition } from "../_shared/dispositionClassifier.ts";
+import { classifyCall, applyDisposition, classifyJoinIntent } from "../_shared/dispositionClassifier.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -23,6 +23,8 @@ const TERMINAL_STATUSES = new Set([
 // wallet_balance decrement on organization_subscriptions.
 const CALL_COST_PER_MINUTE = 3.0;
 const WHATSAPP_UTILITY_COST_PER_MSG = 0.20;
+const WHATSAPP_MARKETING_COST_PER_MSG = 1.00;
+const RESEND_API_KEY = Deno.env.get("RESEND_API_KEY");
 
 // Org-specific post-call WhatsApp template config.
 // from_number overrides the default EXOTEL_SENDER_NUMBER env when set —
@@ -31,12 +33,16 @@ const POST_CALL_WA_BY_ORG: Record<string, {
   template_name: string;
   language_code: string;
   from_number?: string;
+  // Per-message cost (₹). Defaults to the utility rate; set the marketing rate
+  // when Meta classifies the template as MARKETING (e.g. training_link_v4).
+  cost_per_msg?: number;
   body_params: (ctx: { firstName: string }) => string[];
 }> = {
   "6dcf4229-6902-4cd4-9c7f-2d6ed4a6045d": {
     template_name: "iedup_cmyuva_training_link_v4",
     language_code: "hi",
     from_number: "+918808359820",
+    cost_per_msg: WHATSAPP_MARKETING_COST_PER_MSG, // Meta classed v4 as MARKETING
     body_params: ({ firstName }) => [firstName],
   },
 };
@@ -164,6 +170,17 @@ serve(async (req) => {
     }));
   }
 
+  // Reminder calls: capture the prospect's join/decline answer and notify the host.
+  if (callLog.org_id === INSYNC_DEMO_ORG_ID && callLog.contact_id && (contextDetails as any)?.purpose === "reminder") {
+    // @ts-ignore EdgeRuntime is a Supabase runtime global
+    EdgeRuntime.waitUntil(handleReminderResult(supabase, {
+      orgId: callLog.org_id as string,
+      contactId: callLog.contact_id as string,
+      transcript,
+      durationSec,
+    }));
+  }
+
   // Org-specific post-call WhatsApp send (5s after hangup, fire-and-forget).
   // Atomic claim: only the FIRST terminal webhook per call_log fires the send.
   const waConfig = POST_CALL_WA_BY_ORG[callLog.org_id as string];
@@ -242,6 +259,7 @@ async function sendPostCallWhatsApp(
 
     const cleanTo = String(toNumber).replace(/^\+/, "").replace(/^0+/, "");
     const params = args.config.body_params({ firstName });
+    const msgCost = args.config.cost_per_msg ?? WHATSAPP_UTILITY_COST_PER_MSG;
 
     // Pre-insert a whatsapp_logs row in "queued" state so the dashboard can see
     // attempts even before Exotel responds.
@@ -322,7 +340,7 @@ async function sendPostCallWhatsApp(
             status: "sent",
             sent_at: new Date().toISOString(),
             exotel_msg_sid: msgSid,
-            cost_charged: WHATSAPP_UTILITY_COST_PER_MSG,
+            cost_charged: msgCost,
           })
           .eq("id", waLogId);
       }
@@ -332,8 +350,8 @@ async function sendPostCallWhatsApp(
         serviceType: "whatsapp",
         referenceId: waLogId || args.callLogId,
         quantity: 1,
-        cost: WHATSAPP_UTILITY_COST_PER_MSG,
-        description: `WhatsApp utility template ${args.config.template_name} → ${cleanTo}`,
+        cost: msgCost,
+        description: `WhatsApp ${msgCost >= WHATSAPP_MARKETING_COST_PER_MSG ? "marketing" : "utility"} template ${args.config.template_name} → ${cleanTo}`,
       });
     } else {
       console.error("post-call-wa send failed:", JSON.stringify(result));
@@ -551,6 +569,88 @@ async function autoDisposition(
     }
   } catch (e) {
     console.error("autoDisposition error:", String(e));
+  }
+}
+
+// Reminder-call result: classify the prospect's join/decline answer, update the
+// meeting RSVP, and notify the host (in-app always; WhatsApp + email on a clear yes/no).
+async function handleReminderResult(
+  supabase: any,
+  args: { orgId: string; contactId: string; transcript: string | null; durationSec: number | null },
+): Promise<void> {
+  try {
+    const transcript = args.transcript || "";
+    const connected = (args.durationSec ?? 0) > 0 && /(?:^|\n)\s*user\s*:/i.test(transcript);
+    if (!connected) return; // no answer — nothing to report
+
+    const anthropicKey = Deno.env.get("ANTHROPIC_API_KEY");
+    const cls = anthropicKey ? await classifyJoinIntent(anthropicKey, transcript) : { intent: "unclear" as const, reschedule_text: null };
+    const intent = cls.intent;
+    const rescheduleText = cls.reschedule_text;
+
+    const { data: contact } = await supabase.from("contacts").select("first_name, product").eq("id", args.contactId).maybeSingle();
+    const { data: os } = await supabase.from("organization_settings").select("demo_host_user_id").eq("org_id", args.orgId).maybeSingle();
+    const hostId = os?.demo_host_user_id;
+    const { data: mtg } = await supabase.from("contact_activities")
+      .select("id, scheduled_at").eq("contact_id", args.contactId).eq("activity_type", "meeting")
+      .order("scheduled_at", { ascending: false }).limit(1).maybeSingle();
+
+    if (mtg && intent !== "unclear") {
+      await supabase.from("contact_activities").update({
+        demo_rsvp_status: intent === "yes" ? "accepted" : "declined",
+        demo_rsvp_at: new Date().toISOString(),
+      }).eq("id", mtg.id);
+    }
+    if (!hostId) return;
+
+    const prospect = contact?.first_name || "The prospect";
+    const productLabel = String(contact?.product || "").toLowerCase() === "vendorverification" ? "Vendor Verification" : "WorkSync";
+    const whenStr = mtg?.scheduled_at
+      ? new Date(mtg.scheduled_at).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short", timeZone: "Asia/Kolkata" })
+      : "their scheduled time";
+    const statusText = intent === "yes" ? "has confirmed they will be joining"
+      : intent === "no" ? `cannot make it and would like to reschedule${rescheduleText ? ` (prefers: ${rescheduleText})` : ""}`
+      : "gave an unclear answer about joining";
+
+    const { data: host } = await supabase.from("profiles").select("first_name, phone, email").eq("id", hostId).maybeSingle();
+    const hostName = host?.first_name || "there";
+
+    // In-app notification (always)
+    await supabase.from("notifications").insert({
+      org_id: args.orgId, user_id: hostId, type: "demo_attendance",
+      title: intent === "yes" ? "Prospect will join the demo" : intent === "no" ? "Prospect can't make the demo" : "Demo reminder — unclear answer",
+      message: `${prospect} (${productLabel}) ${statusText} — demo at ${whenStr} IST.`,
+      entity_type: "contact", entity_id: args.contactId, action_url: `/contacts/${args.contactId}`,
+      metadata: { intent }, expires_at: new Date(Date.now() + 30 * 864e5).toISOString(),
+    });
+
+    if (intent === "unclear") return; // WhatsApp + email only on a clear yes/no
+
+    // Email to host
+    if (RESEND_API_KEY && host?.email) {
+      const { data: es } = await supabase.from("email_settings").select("sending_domain, verification_status, is_active").eq("org_id", args.orgId).maybeSingle();
+      if (es?.is_active && es.verification_status === "verified") {
+        const subject = intent === "yes" ? `Demo confirmed: ${prospect} will join` : `Demo: ${prospect} needs to reschedule`;
+        const html = `<div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;max-width:520px;margin:0 auto;color:#222;line-height:1.6"><p>Hi ${hostName},</p><p><strong>${prospect}</strong> (${productLabel}) ${statusText}.</p><p><strong>Demo:</strong> ${whenStr} IST</p>${intent === "no" ? "<p>They'd like a different time — please reach out to reschedule.</p>" : "<p>No action needed — see you on the call.</p>"}<p style="margin-top:24px">— In-Sync</p></div>`;
+        await fetch("https://api.resend.com/emails", { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${RESEND_API_KEY}` }, body: JSON.stringify({ from: `In-Sync <noreply@${es.sending_domain}>`, to: [host.email], subject, html }) }).catch(() => {});
+      }
+    }
+
+    // WhatsApp to host (demo_attendance_update template, when approved)
+    if (host?.phone) {
+      const { data: tpl } = await supabase.from("communication_templates").select("status, language").eq("org_id", args.orgId).eq("template_name", "demo_attendance_update").eq("template_type", "whatsapp").maybeSingle();
+      const { data: ex } = await supabase.from("exotel_settings").select("*").eq("org_id", args.orgId).eq("is_active", true).maybeSingle();
+      if (tpl?.status === "approved" && ex?.whatsapp_enabled) {
+        let phone = String(host.phone).replace(/[^0-9+]/g, "");
+        if (!phone.startsWith("+")) phone = phone.length === 10 ? "+91" + phone : "+" + phone;
+        const apiKey = ex.whatsapp_api_key || ex.api_key, apiToken = ex.whatsapp_api_token || ex.api_token, sub = ex.whatsapp_subdomain || ex.subdomain, sid = ex.whatsapp_account_sid || ex.account_sid;
+        const params = [hostName, prospect, statusText, whenStr];
+        const payload = { status_callback: `${Deno.env.get("SUPABASE_URL")}/functions/v1/whatsapp-webhook`, whatsapp: { messages: [{ from: ex.whatsapp_source_number, to: phone, content: { type: "template", template: { name: "demo_attendance_update", language: { policy: "deterministic", code: tpl.language || "en" }, components: [{ type: "body", parameters: params.map((p) => ({ type: "text", text: String(p) })) }] } } }] } };
+        await fetch(`https://${sub}/v2/accounts/${sid}/messages`, { method: "POST", headers: { "Content-Type": "application/json", Authorization: "Basic " + btoa(`${apiKey}:${apiToken}`) }, body: JSON.stringify(payload) }).catch(() => {});
+      }
+    }
+  } catch (e) {
+    console.error("handleReminderResult error:", String(e));
   }
 }
 
