@@ -21,6 +21,7 @@ const TERMINAL_STATUSES = new Set([
 // wallet_balance decrement on organization_subscriptions.
 const CALL_COST_PER_MINUTE = 3.0;
 const WHATSAPP_UTILITY_COST_PER_MSG = 0.20;
+const WHATSAPP_MARKETING_COST_PER_MSG = 1.00;
 
 // Org-specific post-call WhatsApp template config.
 // from_number overrides the default EXOTEL_SENDER_NUMBER env when set —
@@ -29,12 +30,16 @@ const POST_CALL_WA_BY_ORG: Record<string, {
   template_name: string;
   language_code: string;
   from_number?: string;
+  // Per-message cost (₹). Defaults to the utility rate; set the marketing rate
+  // when Meta classifies the template as MARKETING (e.g. training_link_v4).
+  cost_per_msg?: number;
   body_params: (ctx: { firstName: string }) => string[];
 }> = {
   "6dcf4229-6902-4cd4-9c7f-2d6ed4a6045d": {
-    template_name: "iedup_cmyuva_training_link_v2",
+    template_name: "iedup_cmyuva_training_link_v4",
     language_code: "hi",
     from_number: "+918808359820",
+    cost_per_msg: WHATSAPP_MARKETING_COST_PER_MSG, // Meta classed v4 as MARKETING
     body_params: ({ firstName }) => [firstName],
   },
 };
@@ -225,6 +230,7 @@ async function sendPostCallWhatsApp(
 
     const cleanTo = String(toNumber).replace(/^\+/, "").replace(/^0+/, "");
     const params = args.config.body_params({ firstName });
+    const msgCost = args.config.cost_per_msg ?? WHATSAPP_UTILITY_COST_PER_MSG;
 
     // Pre-insert a whatsapp_logs row in "queued" state so the dashboard can see
     // attempts even before Exotel responds.
@@ -305,7 +311,7 @@ async function sendPostCallWhatsApp(
             status: "sent",
             sent_at: new Date().toISOString(),
             exotel_msg_sid: msgSid,
-            cost_charged: WHATSAPP_UTILITY_COST_PER_MSG,
+            cost_charged: msgCost,
           })
           .eq("id", waLogId);
       }
@@ -315,8 +321,8 @@ async function sendPostCallWhatsApp(
         serviceType: "whatsapp",
         referenceId: waLogId || args.callLogId,
         quantity: 1,
-        cost: WHATSAPP_UTILITY_COST_PER_MSG,
-        description: `WhatsApp utility template ${args.config.template_name} → ${cleanTo}`,
+        cost: msgCost,
+        description: `WhatsApp ${msgCost >= WHATSAPP_MARKETING_COST_PER_MSG ? "marketing" : "utility"} template ${args.config.template_name} → ${cleanTo}`,
       });
     } else {
       console.error("post-call-wa send failed:", JSON.stringify(result));

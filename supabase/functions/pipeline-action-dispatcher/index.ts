@@ -32,6 +32,9 @@ const WHATSAPP_MARKETING_COST_PER_MSG = 1.00;
 // Templates Meta classifies as MARKETING (charged at the marketing rate).
 const MARKETING_TEMPLATES = new Set<string>([
   "iedup_cmyuva_registration_steps_v2",
+  // Meta re-classified the help-desk template as MARKETING on the v2 re-file
+  // (was UTILITY); bill it at the marketing rate so the wallet stays accurate.
+  "iedup_cmyuva_training_helpdesk_v2",
 ]);
 function waCostFor(templateName: string | null): number {
   return templateName && MARKETING_TEMPLATES.has(templateName)
@@ -82,7 +85,7 @@ async function processOrg(supabase: any, orgId: string): Promise<unknown> {
   // Window is read live from the saved org setting — fully configurable.
   const { data: os } = await supabase
     .from("organization_settings")
-    .select("calling_windows")
+    .select("calling_windows, act_today_only, enforce_wallet_in_trial")
     .eq("org_id", orgId)
     .maybeSingle();
 
@@ -90,6 +93,25 @@ async function processOrg(supabase: any, orgId: string): Promise<unknown> {
   if (!win.inside) {
     return { org_id: orgId, acted: false, reason: win.reason };
   }
+
+  // Hard wallet cap: when the org opts in (IEDUP), stop all sends once the wallet
+  // is spent — even during the free trial. Mirrors the dialer's candidate-side
+  // gate so calls and WhatsApp respect the same ceiling.
+  if (os?.enforce_wallet_in_trial) {
+    const { data: sub } = await supabase
+      .from("organization_subscriptions")
+      .select("wallet_balance, wallet_minimum_balance")
+      .eq("org_id", orgId)
+      .maybeSingle();
+    const balance = Number(sub?.wallet_balance ?? 0);
+    const minBalance = Number(sub?.wallet_minimum_balance ?? 0);
+    if (balance <= minBalance) {
+      return { org_id: orgId, acted: false, reason: `wallet exhausted (balance ${balance.toFixed(2)} <= min ${minBalance.toFixed(2)})` };
+    }
+  }
+
+  const todayOnly = !!os?.act_today_only;
+  const istTodayStart = todayOnly ? istStartOfTodayMs() : 0;
 
   const { data: rows } = await supabase
     .from("pipeline_action_queue")
@@ -108,14 +130,33 @@ async function processOrg(supabase: any, orgId: string): Promise<unknown> {
   const contactIds = [...new Set(queue.map((r) => r.contact_id))];
   const { data: contactRows } = await supabase
     .from("contacts")
-    .select("id, first_name, last_name, name_hi, company, job_title, phone, do_not_call")
+    .select("id, first_name, last_name, name_hi, company, job_title, phone, do_not_call, created_at")
     .in("id", contactIds);
   const contactById = new Map<string, any>((contactRows || []).map((c: any) => [c.id, c]));
 
   let waSent = 0, waFailed = 0, callsTriggered = 0, skipped = 0;
 
+  // Today-only: when the org opts in (IEDUP), drop (and mark skipped) any queued
+  // action whose contact was uploaded before today (IST), so automation only ever
+  // acts on the day's data.
+  let activeQueue = queue;
+  if (todayOnly) {
+    const keep: QueueRow[] = [];
+    for (const r of queue) {
+      const c = contactById.get(r.contact_id);
+      const createdMs = c?.created_at ? Date.parse(c.created_at) : 0;
+      if (createdMs >= istTodayStart) {
+        keep.push(r);
+      } else {
+        await markQueue(supabase, r.id, "skipped", "past-day data (act_today_only)");
+        skipped++;
+      }
+    }
+    activeQueue = keep;
+  }
+
   // ---- WhatsApp -------------------------------------------------------------
-  const waRows = queue.filter((r) => r.action_type === "whatsapp").slice(0, MAX_WA_PER_TICK);
+  const waRows = activeQueue.filter((r) => r.action_type === "whatsapp").slice(0, MAX_WA_PER_TICK);
   if (waRows.length > 0) {
     const sender = WA_SENDER_BY_ORG[orgId] || Deno.env.get("EXOTEL_SENDER_NUMBER") || "";
     for (const r of waRows) {
@@ -133,7 +174,7 @@ async function processOrg(supabase: any, orgId: string): Promise<unknown> {
   }
 
   // ---- Calls (concurrency-capped) ------------------------------------------
-  const callRows = queue.filter((r) => r.action_type === "call");
+  const callRows = activeQueue.filter((r) => r.action_type === "call");
   if (callRows.length > 0) {
     const bolnaKey = Deno.env.get("BOLNA_API_KEY");
     const { data: script } = await supabase
@@ -209,8 +250,9 @@ async function sendWhatsAppTemplate(
   const cleanTo = phone.replace(/^\+/, "").replace(/^0+/, "");
 
   // Only the help-desk template carries a {{1}} name variable; the rest are generic.
+  // Match by prefix so the name is filled across help-desk versions (v1, v2, …).
   const name = contact.name_hi || contact.first_name || "प्रतिभागी";
-  const params: string[] = row.template_name === "iedup_cmyuva_training_helpdesk_v1" ? [name] : [];
+  const params: string[] = (row.template_name || "").startsWith("iedup_cmyuva_training_helpdesk") ? [name] : [];
   const components = params.length > 0
     ? [{ type: "body", parameters: params.map((p) => ({ type: "text", text: p })) }]
     : [];
@@ -436,6 +478,13 @@ async function markQueue(supabase: any, id: string, status: string, error: strin
     .from("pipeline_action_queue")
     .update({ status, last_error: error, processed_at: new Date().toISOString(), attempts: 1 })
     .eq("id", id);
+}
+
+// UTC epoch-ms for the start of "today" in IST (UTC+5:30).
+function istStartOfTodayMs(now: Date = new Date()): number {
+  const offsetMs = (5 * 60 + 30) * 60 * 1000;
+  const istMidnight = Math.floor((now.getTime() + offsetMs) / 86400000) * 86400000;
+  return istMidnight - offsetMs;
 }
 
 function done(status: number, body: unknown): Response {
