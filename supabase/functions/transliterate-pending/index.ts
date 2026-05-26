@@ -12,8 +12,8 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
 };
 
-const BATCH = 500;          // transliterate-names hard limit per call
-const MAX_PER_RUN = 3000;   // cap work per invocation; cron catches the rest
+const BATCH = 100;          // keep the AI response well under max_tokens (500 truncates → JSON fails)
+const MAX_PER_RUN = 500;    // ~5 AI calls/invocation; stay within the function time budget
 
 serve(async (req) => {
   if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
