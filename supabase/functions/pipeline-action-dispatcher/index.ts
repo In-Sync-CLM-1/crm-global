@@ -32,6 +32,9 @@ const WHATSAPP_MARKETING_COST_PER_MSG = 1.00;
 // Templates Meta classifies as MARKETING (charged at the marketing rate).
 const MARKETING_TEMPLATES = new Set<string>([
   "iedup_cmyuva_registration_steps_v2",
+  // Meta re-classified the help-desk template as MARKETING on the v2 re-file
+  // (was UTILITY); bill it at the marketing rate so the wallet stays accurate.
+  "iedup_cmyuva_training_helpdesk_v2",
 ]);
 function waCostFor(templateName: string | null): number {
   return templateName && MARKETING_TEMPLATES.has(templateName)
@@ -247,8 +250,9 @@ async function sendWhatsAppTemplate(
   const cleanTo = phone.replace(/^\+/, "").replace(/^0+/, "");
 
   // Only the help-desk template carries a {{1}} name variable; the rest are generic.
+  // Match by prefix so the name is filled across help-desk versions (v1, v2, …).
   const name = contact.name_hi || contact.first_name || "प्रतिभागी";
-  const params: string[] = row.template_name === "iedup_cmyuva_training_helpdesk_v1" ? [name] : [];
+  const params: string[] = (row.template_name || "").startsWith("iedup_cmyuva_training_helpdesk") ? [name] : [];
   const components = params.length > 0
     ? [{ type: "body", parameters: params.map((p) => ({ type: "text", text: p })) }]
     : [];

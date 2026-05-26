@@ -24,10 +24,13 @@ const TEMPLATE_LABELS: Record<string, string> = {
   iedup_cmyuva_certificate_ready_v1: "Certificate ready",
   iedup_cmyuva_registration_steps_v1: "Registration steps",
   iedup_cmyuva_payment_failed_v1: "Payment failed",
+  iedup_cmyuva_payment_failed_v2: "Payment failed",
   iedup_cmyuva_training_helpdesk_v1: "Help desk",
+  iedup_cmyuva_training_helpdesk_v2: "Help desk",
   iedup_cmyuva_photo_reupload_v1: "Photo re-upload",
   iedup_cmyuva_training_link_v2: "Training link",
   iedup_cmyuva_training_link_v3: "Training link",
+  iedup_cmyuva_training_link_v4: "Training link",
 };
 const templateLabel = (n: string | null) =>
   n ? (TEMPLATE_LABELS[n] || n.replace(/^iedup_cmyuva_/, "").replace(/_v\d+$/, "").replace(/_/g, " ")) : "—";

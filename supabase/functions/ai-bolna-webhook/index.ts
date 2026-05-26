@@ -4,7 +4,9 @@ import {
   isInsideWorkingWindow,
   triggerBolnaCall,
   BILLABLE_CALL_ORG_IDS,
+  INSYNC_DEMO_ORG_ID,
 } from "../_shared/aiCalling.ts";
+import { classifyCall, applyDisposition } from "../_shared/dispositionClassifier.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -32,7 +34,7 @@ const POST_CALL_WA_BY_ORG: Record<string, {
   body_params: (ctx: { firstName: string }) => string[];
 }> = {
   "6dcf4229-6902-4cd4-9c7f-2d6ed4a6045d": {
-    template_name: "iedup_cmyuva_training_link_v2",
+    template_name: "iedup_cmyuva_training_link_v4",
     language_code: "hi",
     from_number: "+918808359820",
     body_params: ({ firstName }) => [firstName],
@@ -145,6 +147,21 @@ serve(async (req) => {
         description: `AI call ${callLog.id} — ${minutes} min × Rs ${CALL_COST_PER_MINUTE}/min`,
       }),
     );
+  }
+
+  // In-Sync Demo: AI auto-sets the disposition from the call outcome, which fires
+  // the calendar/notification + follow-up message chain. Background task so the
+  // webhook responds fast.
+  if (callLog.org_id === INSYNC_DEMO_ORG_ID && callLog.contact_id && (contextDetails as any)?.purpose !== "reminder") {
+    // @ts-ignore EdgeRuntime is a Supabase runtime global
+    EdgeRuntime.waitUntil(autoDisposition(supabase, {
+      callLogId: callLog.id as string,
+      orgId: callLog.org_id as string,
+      contactId: callLog.contact_id as string,
+      status,
+      durationSec,
+      transcript,
+    }));
   }
 
   // Org-specific post-call WhatsApp send (5s after hangup, fire-and-forget).
@@ -470,6 +487,71 @@ async function dispatchNextInBatch(supabase: any, batchId: string): Promise<void
       started_at: new Date().toISOString(),
     })
     .eq("id", nextRow.id);
+}
+
+async function autoDisposition(
+  supabase: any,
+  args: { callLogId: string; orgId: string; contactId: string; status: string; durationSec: number | null; transcript: string | null },
+): Promise<void> {
+  try {
+    // Idempotent: skip if a disposition is already set (duplicate webhooks).
+    const { data: cl } = await supabase.from("call_logs").select("disposition_id").eq("id", args.callLogId).maybeSingle();
+    if (cl?.disposition_id) return;
+
+    const transcript = args.transcript || "";
+    const connected = (args.durationSec ?? 0) > 0 && /(?:^|\n)\s*user\s*:/i.test(transcript);
+
+    let outcomeKey: string;
+    let demoDate: string | null = null;
+    let demoTime: string | null = null;
+    let optOut = false;
+    let summary: string | null = null;
+
+    if (!connected) {
+      outcomeKey = (args.status === "no-answer" || args.status === "busy") ? "no_answer" : "not_connected";
+    } else {
+      const anthropicKey = Deno.env.get("ANTHROPIC_API_KEY");
+      const { data: c } = await supabase.from("contacts").select("product").eq("id", args.contactId).maybeSingle();
+      const productLabel = String(c?.product || "").toLowerCase() === "vendorverification" ? "Vendor Verification" : "WorkSync";
+      const { data: keyRows } = await supabase.from("ai_outcome_disposition_map").select("outcome_key").eq("org_id", args.orgId);
+      const keys = (keyRows || []).map((r: any) => r.outcome_key);
+      const cls = anthropicKey ? await classifyCall(anthropicKey, { transcript, productLabel, outcomeKeys: keys }) : null;
+      if (cls) {
+        outcomeKey = cls.outcome_key;
+        demoDate = cls.demo_date;
+        demoTime = cls.demo_time;
+        optOut = cls.opt_out;
+        summary = cls.summary;
+      } else {
+        outcomeKey = "interested"; // safe fallback for a connected call we couldn't classify
+      }
+    }
+
+    await applyDisposition(supabase, {
+      orgId: args.orgId,
+      callLogId: args.callLogId,
+      contactId: args.contactId,
+      outcomeKey,
+      demoDate,
+      demoTime,
+      optOut,
+      summary,
+      callDuration: args.durationSec,
+      fireAutomation: true,
+    });
+
+    // Follow-up email/WhatsApp only for positive outcomes (and not if opted out).
+    const SEND_FOLLOWUP = new Set(["demo_agreed", "interested", "callback", "decision_maker"]);
+    if (SEND_FOLLOWUP.has(outcomeKey) && !optOut) {
+      await fetch(`${Deno.env.get("SUPABASE_URL")}/functions/v1/send-post-call-message`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")}` },
+        body: JSON.stringify({ call_log_id: args.callLogId }),
+      }).catch((e) => console.warn("send-post-call-message invoke failed:", e));
+    }
+  } catch (e) {
+    console.error("autoDisposition error:", String(e));
+  }
 }
 
 function json200(body: unknown): Response {
