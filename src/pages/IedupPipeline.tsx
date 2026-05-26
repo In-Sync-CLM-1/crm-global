@@ -55,9 +55,12 @@ interface BeneficiaryRow {
   do_not_call: boolean | null;
   status: string | null;
   created_at: string | null;
+  pipeline_stage_id?: string | null;
   last_call_at?: string | null;
   attempts?: number;
   connected?: number;
+  action?: string | null;
+  disposition?: string | null;
 }
 
 function callCapExhausted(b: BeneficiaryRow): boolean {
@@ -112,7 +115,7 @@ export default function IedupPipeline() {
     queryFn: async () => {
       const { data, error } = await supabase
         .from("contacts")
-        .select("id, first_name, last_name, name_hi, phone, do_not_call, status, created_at")
+        .select("id, first_name, last_name, name_hi, phone, do_not_call, status, created_at, pipeline_stage_id")
         .eq("org_id", IEDUP_ORG_ID)
         .order("created_at", { ascending: false });
       if (error) throw error;
@@ -120,7 +123,7 @@ export default function IedupPipeline() {
       if (rows.length === 0) return rows;
 
       const ids = rows.map((r) => r.id);
-      const [callsRes, statsRes] = await Promise.all([
+      const [callsRes, statsRes, stagesRes, dispoRes] = await Promise.all([
         supabase
           .from("call_logs")
           .select("contact_id, started_at")
@@ -129,6 +132,10 @@ export default function IedupPipeline() {
           .not("started_at", "is", null)
           .order("started_at", { ascending: false }),
         supabase.rpc("contact_ai_call_stats", { p_contact_ids: ids }),
+        // Action = the contact's pipeline stage (the "Send WhatsApp - …" / "Call" action).
+        supabase.from("pipeline_stages").select("id, name").eq("org_id", IEDUP_ORG_ID),
+        // Disposition = latest call/WhatsApp outcome from the shared view.
+        supabase.from("contact_latest_disposition").select("contact_id, disposition_name").eq("org_id", IEDUP_ORG_ID).in("contact_id", ids),
       ]);
 
       const latest = new Map<string, string>();
@@ -140,11 +147,21 @@ export default function IedupPipeline() {
       for (const s of (statsRes.data || []) as Array<{ contact_id: string; attempts: number; connected: number }>) {
         stats.set(s.contact_id, { attempts: Number(s.attempts), connected: Number(s.connected) });
       }
+      const stageName = new Map<string, string>();
+      for (const s of (stagesRes.data || []) as Array<{ id: string; name: string }>) {
+        stageName.set(s.id, s.name);
+      }
+      const dispo = new Map<string, string>();
+      for (const d of (dispoRes.data || []) as Array<{ contact_id: string; disposition_name: string }>) {
+        if (d.contact_id && d.disposition_name) dispo.set(d.contact_id, d.disposition_name);
+      }
       return rows.map((r) => ({
         ...r,
         last_call_at: latest.get(r.id) ?? null,
         attempts: stats.get(r.id)?.attempts || 0,
         connected: stats.get(r.id)?.connected || 0,
+        action: r.pipeline_stage_id ? (stageName.get(r.pipeline_stage_id) ?? null) : null,
+        disposition: dispo.get(r.id) ?? null,
       }));
     },
     refetchInterval: 30_000,
@@ -711,8 +728,10 @@ export default function IedupPipeline() {
                       <TableHead>Name (EN)</TableHead>
                       <TableHead>Name (HI)</TableHead>
                       <TableHead>Number</TableHead>
+                      <TableHead>Action</TableHead>
                       <TableHead>Uploaded</TableHead>
                       <TableHead>Status</TableHead>
+                      <TableHead>Disposition</TableHead>
                       <TableHead>Last call</TableHead>
                       <TableHead className="text-right">Actions</TableHead>
                     </TableRow>
@@ -735,6 +754,13 @@ export default function IedupPipeline() {
                           <TableCell>{[b.first_name, b.last_name].filter(Boolean).join(" ")}</TableCell>
                           <TableCell className="font-medium">{b.name_hi || "—"}</TableCell>
                           <TableCell className="font-mono text-sm">{b.phone}</TableCell>
+                          <TableCell>
+                            {b.action ? (
+                              <Badge variant="outline" className="whitespace-nowrap">{b.action}</Badge>
+                            ) : (
+                              <span className="text-xs text-muted-foreground">—</span>
+                            )}
+                          </TableCell>
                           <TableCell className="text-xs text-muted-foreground">
                             {b.created_at ? new Date(b.created_at).toLocaleDateString() : "—"}
                           </TableCell>
@@ -749,6 +775,13 @@ export default function IedupPipeline() {
                               <Badge variant="secondary">{attempts}/3 tried</Badge>
                             ) : (
                               <Badge variant="outline">Pending</Badge>
+                            )}
+                          </TableCell>
+                          <TableCell>
+                            {b.disposition ? (
+                              <Badge variant="secondary" className="whitespace-nowrap">{b.disposition}</Badge>
+                            ) : (
+                              <span className="text-xs text-muted-foreground">—</span>
                             )}
                           </TableCell>
                           <TableCell className="text-xs text-muted-foreground">
