@@ -1,0 +1,10 @@
+name = "globalcrm-cron"
+main = "src/index.js"
+compatibility_date = "2026-05-01"
+
+# Reliable external scheduler — replaces the flaky in-database pg_net crons that
+# fail DNS (~1.5% success) for these functions. Runs every minute and triggers
+# the critical edge functions directly (HTTP from Cloudflare's edge resolves the
+# Supabase host fine, unlike pg_net inside the DB).
+[triggers]
+crons = ["* * * * *"]
