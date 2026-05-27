@@ -34,7 +34,7 @@ JOBS=(
   "scheduled-messages-processor|scheduled-messages-processor|*/5 * * * *"
   "transcribe-and-analyze-recordings|transcribe-and-analyze-recordings|5 13 * * *"
   # Former pure-SQL pg_cron jobs, now invoked via PostgREST RPC (rpc:<fn>) so pg_cron is fully retired.
-  "retry-failed-whatsapp|rpc:trigger_retry_failed_whatsapp|0 * * * *"
+  # (retry-failed-whatsapp removed — its function only posted to a migrated-away project.)
   "check-inactive-contacts|rpc:check_inactive_contacts|0 9 * * *"
   "process-time-based-triggers|rpc:process_time_based_triggers|0 8 * * *"
   "aggregate-automation-performance|rpc:cron_aggregate_automation_performance|0 1 * * *"
