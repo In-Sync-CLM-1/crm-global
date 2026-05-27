@@ -63,9 +63,9 @@ function enrich(r: AgentRow) {
     verdict = { label: "Too early", tone: "muted", note: "Not enough calls yet to judge — let it run." };
   } else if (r.reached === 0) {
     verdict = {
-      label: "Not reaching people",
-      tone: "bad",
-      note: "Calls pick up but land on voicemail / auto-answer. Fix connection (timing, number quality, voicemail detection) before judging the pitch.",
+      label: "No conversations yet",
+      tone: "muted",
+      note: "Calls are connecting but no live conversation has been recorded yet — normal early in the process. This fills in as more calls land.",
     };
   } else if (demoRate >= 0.15) {
     verdict = { label: "Strong", tone: "good", note: "Booking demos at a healthy rate — prioritise scaling this product." };
