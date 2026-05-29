@@ -39,3 +39,6 @@ scripts/seed-demo-data.mjs
 tmp/
 .wrangler/
 .claude/
+.tmp_*
+.tmp.*
+cron-worker/.tmp.toml
