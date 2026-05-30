@@ -34,25 +34,23 @@ export default function ProtectedRoute({ children, requiredRole }: ProtectedRout
     staleTime: 5 * 60 * 1000,
   });
 
-  // Fetch subscription status to enforce the non-payment lockout. Readable even
-  // when the org is locked (RLS for the subscription table ignores the lock), so
-  // a locked org can still reach the billing/pay screen.
-  const { data: subData } = useQuery({
-    queryKey: ["org-subscription-status", user?.id],
+  // Enforce the "no money, no service" lockout. A single server-side source of
+  // truth (is_current_org_locked) decides this: it fires when the subscription
+  // is > 2 days overdue OR the wallet has hit its ₹500 reserve floor, and it
+  // exempts internal/demo orgs. Stays readable while locked so the org can still
+  // reach the billing/pay screen and top up to auto-restore access.
+  const { data: orgLocked } = useQuery({
+    queryKey: ["org-locked", user?.id],
     queryFn: async () => {
-      if (!user?.id) return null;
-      const { data: profile } = await supabase
-        .from("profiles")
-        .select("org_id")
-        .eq("id", user.id)
-        .maybeSingle();
-      if (!profile?.org_id) return null;
-      const { data } = await supabase
-        .from("organization_subscriptions")
-        .select("subscription_status")
-        .eq("org_id", profile.org_id)
-        .maybeSingle();
-      return data;
+      if (!user?.id) return false;
+      const { data, error } = await supabase.rpc(
+        "is_current_org_locked" as never
+      );
+      if (error) {
+        console.error("ProtectedRoute - lock check failed:", error);
+        return false; // fail open: never trap a user out of a transient error
+      }
+      return data === true;
     },
     enabled: !!user?.id,
     staleTime: 60 * 1000,
@@ -111,13 +109,11 @@ export default function ProtectedRoute({ children, requiredRole }: ProtectedRout
     return <Navigate to="/onboarding" replace />;
   }
 
-  // Account locked for non-payment (>2 days overdue): the only reachable screen
-  // is /billing so they can pay and auto-restore access. The data layer (RLS)
-  // independently blocks all of the org's data, so this is the UX, not the lock.
-  if (
-    subData?.subscription_status === "suspended_locked" &&
-    location.pathname !== "/billing"
-  ) {
+  // Account locked (subscription overdue OR wallet below the ₹500 floor): the
+  // only reachable screen is /billing so they can pay and auto-restore access.
+  // The data layer (RLS) independently blocks all of the org's data, so this is
+  // the UX redirect, not the lock itself.
+  if (orgLocked && location.pathname !== "/billing") {
     return <Navigate to="/billing" replace />;
   }
 
